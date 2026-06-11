@@ -1,7 +1,8 @@
 # Socrates — Telegram Persona Bot
 
-A Node.js app that imitates a real person over Telegram. It wraps any [OpenRouter](https://openrouter.ai) model with a persona defined in [`person.md`](person.md) and reproduces real human texting behaviour:
+A Node.js app that imitates a real person over Telegram. It drives a **real Telegram user account** (an MTProto userbot via [gramjs](https://github.com/gram-js/gramjs) — not a Bot API bot), wraps any [OpenRouter](https://openrouter.ai) model with a persona defined in [`person.md`](person.md), and reproduces real human texting behaviour:
 
+- **Real account, real presence** — because it's a user account, not a bot, it has a genuine **online / last-seen status** that the app manages (the persona comes online only while reading/typing, then goes offline), **real read receipts** it controls (messages show "read" when the persona actually notices them, not on delivery), and no "bot" badge anywhere.
 - **Realistic reply timing** — the LLM decides how long "you" would take to answer, based on the persona's daily schedule (asleep at night → reply next morning; at work → an hour; evening banter → seconds).
 - **Typing indicator & message bursts** — typing duration scales with message length; long answers arrive as several short messages, like real texting.
 - **Reactions & typos** — occasionally reacts with 👍/🤣 instead of replying, and rarely sends a typo followed by the classic `*correction`.
@@ -13,19 +14,40 @@ A Node.js app that imitates a real person over Telegram. It wraps any [OpenRoute
 
 Everything persists to S3-compatible storage, so the app itself is stateless and survives restarts/redeploys — including "reply tomorrow at 7am" timers.
 
+> ⚠️ This runs an **automated real account**. Telegram's terms restrict abusive automation (spam, mass-messaging, etc.); a normal, low-volume personal conversation is what this is built for. Use an account you control and only with people you're allowed to talk to. See [responsible use](#a-note-on-responsible-use).
+
 > Full technical documentation (architecture, data layout, LLM contract, how to write a `person.md`) lives in [AGENTS.md](AGENTS.md).
 
 ## Prerequisites
 
-1. **Telegram bot** — create one with [@BotFather](https://t.me/BotFather), copy the token. In BotFather, set a real-sounding name and a profile photo; disable `/start`-style command menus (Edit Bot → Edit Commands → leave empty).
-2. **Your contacts' Telegram user IDs** — each allowed person can get theirs from [@userinfobot](https://t.me/userinfobot). Everyone else is silently ignored.
-3. **OpenRouter account** — API key from [openrouter.ai/keys](https://openrouter.ai/keys). Pick a main model that's good at persona instructions + JSON output, and a media model that supports vision *and* audio (e.g. `google/gemini-2.5-flash`) for photos/voice.
-4. **S3-compatible bucket** — AWS S3, Cloudflare R2, Hetzner Object Storage, MinIO… anything with the S3 API.
-5. **A `person.md`** — edit the one in this repo. It ships as a complete example persona; the believability of the whole bot depends on this file. See [AGENTS.md → Crafting a person.md](AGENTS.md#crafting-a-personmd).
+1. **A Telegram account for the persona** — ideally a dedicated account (its own SIM/number) that *is* the persona, with a real-sounding name and profile photo. The app logs in **as this account**.
+2. **Telegram API credentials** — sign in at [my.telegram.org](https://my.telegram.org) → **API development tools** → create an app → copy `api_id` and `api_hash`. These identify your *app*, not the account.
+3. **A login session string** — run `npm run login` locally once (see [Generate the session](#1-generate-the-session-string-once-locally)); it logs the account in (phone + code + 2FA) and prints a `TELEGRAM_SESSION` string. The session is what the deployed app uses — no phone code needed again.
+4. **Your contacts' Telegram user IDs** — each allowed person can get theirs from [@userinfobot](https://t.me/userinfobot). Everyone else is silently ignored.
+5. **OpenRouter account** — API key from [openrouter.ai/keys](https://openrouter.ai/keys). Pick a main model that's good at persona instructions + JSON output, and a media model that supports vision *and* audio (e.g. `google/gemini-2.5-flash`) for photos/voice.
+6. **S3-compatible bucket** — AWS S3, Cloudflare R2, Hetzner Object Storage, MinIO… anything with the S3 API.
+7. **A `person.md`** — edit the one in this repo. It ships as a complete example persona; the believability of the whole thing depends on this file. See [AGENTS.md → Crafting a person.md](AGENTS.md#crafting-a-personmd).
 
 ## Deploy on Railway
 
-1. Push this repository to GitHub (keep it **private** — `person.md` is personal data).
+### 1. Generate the session string (once, locally)
+
+```bash
+cp .env.example .env          # fill in TELEGRAM_API_ID and TELEGRAM_API_HASH
+npm install
+npm run login                 # logs in the persona's account
+```
+
+You'll be asked for the phone number, the login code Telegram sends, and your 2FA password (if set). It prints two things:
+
+- your **numeric user id** — not needed for the persona, but handy,
+- a long **`TELEGRAM_SESSION`** string.
+
+Copy the session string. Treat it like a password: it is full access to the account.
+
+### 2. Deploy
+
+1. Push this repository to GitHub (keep it **private** — `person.md` is personal data and the session is sensitive).
 
 2. In [Railway](https://railway.app): **New Project → Deploy from GitHub repo** and select the repository. Railway detects Node.js automatically (Nixpacks) and runs `npm install` + `npm start`. No Dockerfile needed.
 
@@ -33,8 +55,10 @@ Everything persists to S3-compatible storage, so the app itself is stateless and
 
    | Variable | Value |
    |---|---|
-   | `TELEGRAM_BOT_TOKEN` | from BotFather |
-   | `ALLOWED_USER_IDS` | comma-separated Telegram user IDs |
+   | `TELEGRAM_API_ID` | from my.telegram.org |
+   | `TELEGRAM_API_HASH` | from my.telegram.org |
+   | `TELEGRAM_SESSION` | the string printed by `npm run login` |
+   | `ALLOWED_USER_IDS` | comma-separated Telegram user IDs the persona talks to |
    | `OPENROUTER_API_KEY` | your OpenRouter key |
    | `OPENROUTER_MODEL` | e.g. `deepseek/deepseek-v4-flash` |
    | `OPENROUTER_MEDIA_MODEL` | e.g. `google/gemini-2.5-flash` (vision + audio) |
@@ -42,7 +66,7 @@ Everything persists to S3-compatible storage, so the app itself is stateless and
    | `S3_REGION` / `S3_BUCKET` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | your bucket |
    | `S3_PREFIX` | optional, e.g. `socrates` |
    | `DASHBOARD_PASSWORD` | a strong password for the web dashboard |
-   | `PERSON_TIMEZONE` | e.g. `Europe/Zurich` |
+   | `PERSON_TIMEZONE` | e.g. `Asia/Hong_Kong` |
 
    Do **not** set `PORT` — Railway injects it automatically and the app reads it.
 
@@ -50,23 +74,26 @@ Everything persists to S3-compatible storage, so the app itself is stateless and
 
 5. Recommended Railway settings:
    - **Settings → Deploy → Healthcheck Path**: `/health`
-   - **Replicas: exactly 1.** The bot uses Telegram long polling and in-process timers — two replicas would fight over `getUpdates` and double-send messages.
+   - **Replicas: exactly 1.** The userbot holds one MTProto connection and in-process timers — a second replica would log in the same account twice and double-send messages.
    - **Restart policy**: On Failure. Pending replies/followups are persisted to S3 and restored on boot, so restarts are safe.
-   - Use a plan/settings where the service **never sleeps** — a sleeping service can't send the "7 hours later" reply or run typing indicators. (App sleeping is the killer for this use case; the always-on Hobby/Pro plans are fine.)
+   - Use a plan/settings where the service **never sleeps** — a sleeping service can't send the "7 hours later" reply, manage online status, or run typing indicators. (App sleeping is the killer for this use case; the always-on Hobby/Pro plans are fine.)
 
 6. Deploy. Logs should show:
 
    ```
    [http] listening on :XXXX
-   [telegram] long polling started
+   [telegram] userbot connected as Kin (id 123456789)
+   [telegram] listening for incoming messages
    ```
 
-   Send a message from an allowed account and watch the decision log:
+   Send a message to the persona's account from an allowed contact and watch the decision log:
 
    ```
-   [bot] <- 11111111: hey was machst du
-   [bot] decision for 11111111: answerNeeded=true reaction=- delay=312s followupDelay=14400s memory=false
+   [bot] <- 11111111: u free to do a website?
+   [bot] decision for 11111111: answerNeeded=true reaction=- delay=312s followupDelay=14400s memory=true
    ```
+
+> If logs show *"Telegram session is not authorized"*, the `TELEGRAM_SESSION` is missing/expired or was created with different `api_id`/`api_hash` — re-run `npm run login` with the same API credentials you deploy with.
 
 ### Updating the persona
 
@@ -75,12 +102,12 @@ Everything persists to S3-compatible storage, so the app itself is stateless and
 ## Local development
 
 ```bash
-cp .env.example .env   # fill in real values
+cp .env.example .env   # fill in real values (incl. TELEGRAM_SESSION from `npm run login`)
 npm install
 npm run dev            # auto-restarts on file changes
 ```
 
-Dashboard at `http://localhost:3000/`.
+Dashboard at `http://localhost:3000/`. Running locally logs in the **same account** as production — don't run both at once against one session.
 
 ## Endpoints
 
@@ -93,4 +120,7 @@ Dashboard at `http://localhost:3000/`.
 
 ## A note on responsible use
 
-This bot is built to be indistinguishable from a human. Only point it at people who are in on it or would be okay with it — impersonating someone to deceive others can be harmful and, depending on jurisdiction and context, illegal. The allow-list exists for a reason.
+This drives a real Telegram account and is built to be indistinguishable from a human. Two things to keep in mind:
+
+- **People.** Only point it at people who are in on it or would be okay with it — impersonating someone to deceive others can be harmful and, depending on jurisdiction and context, illegal. The allow-list exists for a reason.
+- **Telegram's terms.** Automating a user account is allowed for normal, non-abusive use; spam, mass-messaging, or scraping can get the account limited or banned. Keep volume human and conversational. Using a dedicated number you own (not your personal account) is wise — a ban affects whatever account holds the session.

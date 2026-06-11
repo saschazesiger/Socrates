@@ -1,14 +1,14 @@
 # Socrates — Telegram Persona Bot
 
-A Node.js/Express application that wraps OpenRouter and imitates a specific real person over Telegram as convincingly as possible. The bot reads a `person.md` profile, keeps per-contact chat history and long-term memory in S3, and reproduces human texting behaviour: realistic reply delays based on time of day, typing indicators, multi-message bursts, emoji reactions, occasional typo + `*correction`, unprompted followups, silence when a real person wouldn't reply, and understanding of incoming photos and voice notes.
+A Node.js/Express application that wraps OpenRouter and imitates a specific real person over Telegram as convincingly as possible. It drives a **real Telegram user account** — an MTProto **userbot** via [gramjs](https://github.com/gram-js/gramjs), not a Bot API bot — which is what lets it manage genuine online/last-seen presence and real read receipts. It reads a `person.md` profile, keeps per-contact chat history and long-term memory in S3, and reproduces human texting behaviour: realistic reply delays based on time of day, online-status management, controlled read receipts, typing indicators, multi-message bursts, emoji reactions, occasional typo + `*correction`, unprompted followups, silence when a real person wouldn't reply, and understanding of incoming photos and voice notes.
 
-Deployment instructions (Railway) live in [README.md](README.md). This file is the technical reference.
+Deployment instructions (Railway, plus the one-time `npm run login` to mint a session) live in [README.md](README.md). This file is the technical reference.
 
 ## Architecture
 
 ```
-Telegram (long polling)
-      │ incoming message (text / photo / voice)
+Telegram user account (gramjs / MTProto, real account)
+      │ incoming message (text / photo / voice) — DELIVERED, not yet read
       ▼
 src/media.js ── photo → description, voice → transcript (OPENROUTER_MEDIA_MODEL)
       │ text representation
@@ -19,23 +19,26 @@ src/bot.js  ── append to chat.jsonl ──► src/store.js ──► S3 (wri
 src/llm.js  ── person.md + memory.txt + chat history + current time ──► OpenRouter
       │            returns the JSON decision (see "LLM contract")
       ▼
-src/humanize.js ── waits answerDelay, reacts, shows "typing…", sends bursts ──► Telegram
+src/humanize.js ── at answerDelay: come ONLINE, mark READ, react,
+      │            show "typing…", send bursts ──► Telegram, then go offline
       │
       └── schedules followup (fires only if the contact stays silent;
       │   after firing, the NEXT followup is generated immediately)
       └── if memoryUpdateNeeded: second LLM call distills chat → memory.txt
 
 src/dashboard.js ── password-protected admin UI/API on "/" (Express)
+scripts/login.mjs ── one-time interactive login → prints TELEGRAM_SESSION
 ```
 
 ### File map
 
 | File | Purpose |
 |---|---|
-| `src/index.js` | Entrypoint. Express server (`/health`, `/status`, dashboard), boots polling, restores persisted timers, runs the hourly followup guard. |
+| `src/index.js` | Entrypoint. Express server (`/health`, `/status`, dashboard), connects the userbot, restores persisted timers, runs the hourly followup guard. |
 | `src/config.js` | Loads and validates all env variables. Fails fast on missing ones. Normalizes the S3 endpoint (adds `https://` if missing). |
-| `src/telegram.js` | Dependency-free Telegram Bot API client: long polling, `sendMessage`, typing action, `setMessageReaction` (+ allowed-emoji normalization), file download. |
-| `src/media.js` | Incoming photos → 1-2 sentence description; voice notes → verbatim transcript. Uses `OPENROUTER_MEDIA_MODEL`. Graceful placeholders on failure. |
+| `src/telegram.js` | gramjs **MTProto userbot** client: connect/auth via StringSession, incoming-message normalization, `sendMessage`, typing action, emoji reactions (+ normalization), **presence (`setOnline`)**, **read receipts (`markRead`)**, media download. Peers handled as serializable `{ id, accessHash }` descriptors. |
+| `scripts/login.mjs` | One-time interactive login (`npm run login`): phone + code + 2FA → prints the `TELEGRAM_SESSION` StringSession. Standalone; needs only `TELEGRAM_API_ID`/`TELEGRAM_API_HASH`. |
+| `src/media.js` | Incoming photos → 1-2 sentence description; voice notes → verbatim transcript (downloaded via gramjs `downloadMedia`). Uses `OPENROUTER_MEDIA_MODEL`. Graceful placeholders on failure. |
 | `src/bot.js` | Conversation engine: allow-list check, debounce, reply/reaction/followup scheduling, followup invariant + guard, restart recovery, memory trigger, dashboard operations. |
 | `src/llm.js` | OpenRouter wrapper. `generateReply` (the JSON contract), `generateFollowup` (re-engagement planning), `updateMemory` (distillation), raw `chatCompletion`. |
 | `src/humanize.js` | Human realism: typing duration ∝ message length, burst splitting, inter-burst pauses, typo + `*correction` (≤1 per send, ~7% chance), long-delay timers. |
@@ -50,8 +53,9 @@ See `.env.example`. All are required unless noted.
 
 | Variable | Meaning |
 |---|---|
-| `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather. |
-| `ALLOWED_USER_IDS` | Comma-separated Telegram user IDs allowed to talk to the bot. **Everyone else is silently ignored.** |
+| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | MTProto app credentials from https://my.telegram.org → API development tools. Identify the *app*, not the account. |
+| `TELEGRAM_SESSION` | gramjs StringSession for the persona's account, minted once by `npm run login`. Full account access — treat as a secret. Empty is allowed only so the login script can run. |
+| `ALLOWED_USER_IDS` | Comma-separated Telegram user IDs the persona talks to. **Everyone else is silently ignored.** |
 | `OPENROUTER_API_KEY` | OpenRouter API key. |
 | `OPENROUTER_MODEL` | Main model slug. Pick one that follows persona instructions well and supports JSON output. |
 | `OPENROUTER_MEDIA_MODEL` | Optional. Vision **and** audio capable model for photo description / voice transcription (recommended: `google/gemini-2.5-flash`). Defaults to `OPENROUTER_MODEL`. |
@@ -72,9 +76,11 @@ Conversations are kept **strictly per contact** — the imitated person talks to
 <S3_PREFIX>/chats/<userId>/state.json   # pending reply/followup timers (restart survival)
 ```
 
-- **chat.jsonl** — one JSON object per line: `{"ts": "<ISO>", "from": "them"|"me", "text": "...", "chatId": <n>}` (reaction log entries additionally carry `"type": "reaction"`). Incoming media appears as text: `[sent a photo: …]` / `[sent a voice message, 12s: "…"]`. `appendChat()` in `src/store.js` is the single general function that appends the new message **and deletes the oldest ones past the 200 limit** in the same operation, then persists to S3.
+- **chat.jsonl** — one JSON object per line: `{"ts": "<ISO>", "from": "them"|"me", "text": "...", "chatId": {id, accessHash}}` (reaction log entries additionally carry `"type": "reaction"`). `chatId` is the serializable peer descriptor (see below). Incoming media appears as text: `[sent a photo: …]` / `[sent a voice message, 12s: "…"]`. `appendChat()` in `src/store.js` is the single general function that appends the new message **and deletes the oldest ones past the 200 limit** in the same operation, then persists to S3.
 - **memory.txt** — plain text bullet notes written by the LLM about this contact (facts, plans, promises, dates). Because chat.jsonl only holds 200 messages, anything important must be distilled here or it is lost. Updated whenever a reply decision sets `memoryUpdateNeeded: true`, or manually via the dashboard.
 - **state.json** — `{pendingReply, pendingFollowup, chatId}` with due timestamps. On boot, `restorePendingTimers()` re-arms them, so a "reply tomorrow morning" or "check in next week" survives restarts. Timers that became due while the app was down fire after a small random "just picked up my phone" delay instead of instantly.
+
+**Peer descriptor.** The userbot identifies a contact by `{ id, accessHash }` (both strings) — everything the app calls "chatId" is this object. It is built from the incoming message's `getInputSender()` and stored verbatim in S3, so the app can send a followup days later (or after a restart) by rebuilding an `Api.InputPeerUser` without re-resolving the entity. This replaces the Bot API's plain numeric chat id + `file_id` model.
 
 ## LLM contract
 
@@ -111,10 +117,13 @@ Sanitization lives in `sanitizeReply()` in `src/llm.js` — adjust the clamps th
 
 Contacts with zero chat history are never cold-opened by the guard.
 
-## Timing & debounce semantics
+## Timing, presence & debounce semantics
 
+- A message arrives **delivered but unread**. The persona does not read it on arrival — the read receipt only appears at the scheduled "seen" moment (see below), producing a realistic *delivered → read later → typing → reply* sequence.
 - A **new incoming message cancels** any pending reply and followup, and re-runs the LLM with the full updated history — like a human re-thinking what to say when a second message arrives. A `generation` counter per user also discards LLM responses (and followup chains) that were still in flight when a newer message arrived.
-- Replies wait silently for `answerDelay`, then (optionally) react, then show **typing** for a duration proportional to the text length (~4–7 chars/sec, capped at 45s), then send. Multi-paragraph answers are sent as separate burst messages with 0.8–2.5s gaps and their own typing periods.
+- **Everything is scheduled at `answerDelay`** via one unified "seen" path (`fireReply`), even a pure silent read (empty text, no reaction). At that moment the persona: comes **online** (`setOnline(true)`), **marks the message read** (`markRead`), optionally **reacts**, optionally **types and replies**, then **lingers online 5–30s and goes offline**. So even "leaving it on read" is modelled: the read receipt shows up `answerDelay` after delivery with no reply.
+- Replies show **typing** for a duration proportional to the text length (~4–7 chars/sec, capped at 45s), then send. Multi-paragraph answers are sent as separate burst messages with 0.8–2.5s gaps and their own typing periods.
+- **Presence is interaction-scoped.** The account is offline by default and only goes online while actively reading/typing/sending (replies, followups, and dashboard manual sends). A per-user offline timer (reset on each action) drops it back offline shortly after, so it never looks permanently online.
 - ~7% of sends introduce one realistic adjacent-letter typo in a word, followed 1.5–5s later by the classic `*correctword` message. At most one typo per send.
 - Every sent burst (including corrections and reactions) is appended to chat.jsonl as `from: "me"`, so the next LLM call sees exactly what was actually said.
 
@@ -122,8 +131,8 @@ Contacts with zero chat history are never cold-opened by the guard.
 
 `src/media.js` converts incoming media to text before anything else touches it:
 
-- **Photos** — downloaded via the Bot API, sent base64 to `OPENROUTER_MEDIA_MODEL` as `image_url`, described in 1-2 sentences (including visible text). Captions are preserved. Stored as `[sent a photo (caption: "…"): description]`.
-- **Voice notes** — downloaded and sent as `input_audio` (ogg/opus as Telegram delivers it) for verbatim transcription. Stored as `[sent a voice message, 12s: "transcript"]`. Gemini models handle ogg audio; if the media model can't, the graceful fallback is stored instead — `[… could not be listened to right now]` — and the persona deflects like a human who couldn't listen ("bin grad ungerwegs, lose spöter").
+- **Photos** — downloaded via gramjs `downloadMedia`, sent base64 to `OPENROUTER_MEDIA_MODEL` as `image_url`, described in 1-2 sentences (including visible text). Captions (which live in `message.message` for MTProto media) are preserved. Stored as `[sent a photo (caption: "…"): description]`.
+- **Voice notes** — downloaded via `downloadMedia` and sent as `input_audio` (ogg/opus as Telegram delivers it) for verbatim transcription. Stored as `[sent a voice message, 12s: "transcript"]`. Gemini models handle ogg audio; if the media model can't, the graceful fallback is stored instead — `[… could not be listened to right now]` — and the persona deflects like a human who couldn't listen ("i listen later la, on the train now").
 
 The reply prompt tells the model these bracketed lines describe media, so the persona reacts to the *content* naturally.
 
@@ -137,18 +146,26 @@ Enabled when `DASHBOARD_PASSWORD` is set; served at `/`. Login exchanges the pas
 
 JSON API under `/api/*` (same token): `POST /api/login`, `GET /api/contacts`, `GET/PUT /api/contacts/:id/memory`, `GET /api/contacts/:id/chat`, `POST /api/contacts/:id/send|cancel|regenerate-followup|update-memory`.
 
-## Telegram realism — what is and isn't possible
+## Telegram realism — what the userbot makes possible
 
-Managed by the app:
+Because Socrates drives a **real user account** (not a Bot API bot), the strongest humanity signals — which a bot account literally cannot produce — are available and actively managed:
+
+- **Online / last-seen status** — the account appears online only while reading/typing/sending, then goes offline (`src/telegram.js` `setOnline`, scheduled in `src/bot.js`). Contacts see a believable presence pattern that matches the persona's schedule, not a 24/7 green dot and not the permanent "no presence" of a bot.
+- **Real read receipts** — `markRead` is called at the persona's "seen" moment, so messages stay on a single check (delivered) until the persona would actually notice them, then flip to read. "Read but not answered" is a deliberate, human state here.
+- **No bot badge** — it's a normal account; no "bot" label, works in any normal private chat, full user feature set.
+
+Also managed by the app (would work on a bot too, but matter just as much):
 - **Typing indicator** — duration scales with message length, re-sent every 4s to stay visible.
-- **Reply timing** — fully LLM-driven per the profile schedule; this is the strongest humanity signal.
+- **Reply timing** — fully LLM-driven per the profile schedule; the single biggest humanity signal.
 - **Message bursts** — humans send 3 short messages, not one essay.
 - **Emoji reactions** — react instead of (or before) replying.
 - **Typos + `*corrections`** — rare, human, and never twice in a row.
-- **Selective silence** — `answerNeeded: false` mimics leaving things on read.
-- **Unprompted followups** — the bot initiates contact, which pure request/response bots never do.
+- **Selective silence** — `answerNeeded: false` mimics leaving things on read (with a real read receipt, per above).
+- **Unprompted followups** — the account initiates contact, which pure request/response bots never do.
 
-Platform limitation: **bot accounts have no online/last-seen status** — Telegram clients simply don't display presence for bots, so there is nothing to fake (and nothing that gives the bot away there). Read receipts (double check) happen implicitly. If true last-seen/online simulation is ever required, the upgrade path is converting `src/telegram.js` to an MTProto **userbot** (a real user account driven by e.g. [gramjs](https://github.com/gram-js/gramjs)); the rest of the codebase (bot.js, llm.js, store.js, humanize.js, media.js) is transport-agnostic and would not change.
+Transport boundary: only `src/telegram.js` (and the `scripts/login.mjs` helper) know about gramjs/MTProto. `bot.js`, `llm.js`, `store.js`, `humanize.js` and `media.js` are transport-agnostic — they deal in the normalized message shape and the `{ id, accessHash }` peer descriptor, so swapping transports again would touch only that one file.
+
+Operational caveat of using a real account: automating a user account is against Telegram's terms if abused (spam/mass-messaging) and can get the account limited or banned. Keep volume conversational; use a dedicated number the persona owns. A login may need re-minting (`npm run login`) if the session is revoked.
 
 ## Crafting a person.md
 
@@ -167,8 +184,9 @@ Rules of thumb: write it like a briefing for an actor, use literal example messa
 ## Running
 
 ```bash
-cp .env.example .env   # fill in real values
+cp .env.example .env   # fill in TELEGRAM_API_ID / TELEGRAM_API_HASH first
 npm install
+npm run login          # one-time: prints TELEGRAM_SESSION → paste into .env
 npm start              # or: npm run dev (auto-restart on file changes)
 ```
 
@@ -176,7 +194,9 @@ Endpoints: `GET /health` (liveness), `GET /status` (per-contact summary), `/` (d
 
 ## Operational notes
 
-- Single process, long polling — do **not** run two instances against the same bot token (Telegram getUpdates conflicts) or the same S3 prefix (lost writes). On Railway: exactly 1 replica, never-sleeping plan.
+- Single process, single MTProto connection — do **not** run two instances with the same `TELEGRAM_SESSION` (the account would be logged in twice and double-send) or against the same S3 prefix (lost writes). On Railway: exactly 1 replica, never-sleeping plan.
+- The `TELEGRAM_SESSION` is full account access — keep it secret, never commit it. Revoking active sessions in Telegram (Settings → Devices) invalidates it; re-mint with `npm run login`.
 - All S3 access is write-through with an in-memory cache; external edits to the S3 files while the app runs are not picked up until restart (use the dashboard's memory editor instead — it writes through the cache).
-- Non-allowed senders are logged and ignored — the bot never reveals it exists to strangers.
+- Non-allowed senders are logged and ignored — the persona never reveals it exists to strangers.
 - Private text, photo and voice messages are handled; stickers/video/documents are currently ignored.
+- Automating a real account carries Telegram ToS / ban risk if used abusively — keep it low-volume and conversational; prefer a dedicated number.

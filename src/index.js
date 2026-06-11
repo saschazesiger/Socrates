@@ -1,7 +1,7 @@
 import express from 'express';
 import { config } from './config.js';
 import { loadPerson } from './llm.js';
-import { startPolling } from './telegram.js';
+import { start as startTelegram } from './telegram.js';
 import { handleIncoming, restorePendingTimers, followupGuardTick, statusSnapshot } from './bot.js';
 import { dashboardRouter } from './dashboard.js';
 
@@ -36,7 +36,7 @@ async function main() {
   // First pass shortly after boot, then hourly.
   setTimeout(() => followupGuardTick().catch(() => {}), 90 * 1000);
   setInterval(() => followupGuardTick().catch(() => {}), config.followupGuardIntervalMs);
-  await startPolling(handleIncoming);
+  await startTelegram(handleIncoming);
 }
 
 main().catch((err) => {

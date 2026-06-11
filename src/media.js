@@ -7,23 +7,20 @@
  * If transcription/description fails, a graceful placeholder is stored — the
  * persona can then react like a human who couldn't listen right now.
  */
-import { downloadFile } from './telegram.js';
+import { downloadMedia } from './telegram.js';
 import { chatCompletion } from './llm.js';
 import { config } from './config.js';
 
 /**
  * Returns the text representation of an incoming Telegram message,
  * resolving photos and voice notes. Plain text passes through unchanged.
+ * `msg` is the normalized message from telegram.js (carries `raw` for download).
  */
 export async function messageToText(msg) {
-  if (msg.text) return msg.text;
-
-  if (msg.photo?.length) {
+  if (msg.isPhoto) {
     const caption = msg.caption ? ` (caption: "${msg.caption}")` : '';
     try {
-      // Last entry is the highest resolution; one below is plenty for the LLM.
-      const size = msg.photo[Math.max(0, msg.photo.length - 2)];
-      const buf = await downloadFile(size.file_id);
+      const buf = await downloadMedia(msg.raw);
       const description = await describePhoto(buf);
       return `[sent a photo${caption}: ${description}]`;
     } catch (err) {
@@ -35,8 +32,8 @@ export async function messageToText(msg) {
   if (msg.voice) {
     const dur = msg.voice.duration ?? 0;
     try {
-      const buf = await downloadFile(msg.voice.file_id);
-      const transcript = await transcribeVoice(buf, msg.voice.mime_type);
+      const buf = await downloadMedia(msg.raw);
+      const transcript = await transcribeVoice(buf, 'audio/ogg');
       return `[sent a voice message, ${dur}s: "${transcript}"]`;
     } catch (err) {
       console.error('[media] voice transcription failed:', err.message);
@@ -44,7 +41,7 @@ export async function messageToText(msg) {
     }
   }
 
-  return '[unsupported message type]';
+  return msg.text || '[unsupported message type]';
 }
 
 async function describePhoto(buffer) {

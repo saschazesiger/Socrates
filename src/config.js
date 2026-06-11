@@ -18,7 +18,13 @@ function normalizeEndpoint(value) {
 
 export const config = {
   telegram: {
-    token: required('TELEGRAM_BOT_TOKEN'),
+    // MTProto userbot credentials (a real user account, not a bot token).
+    // api_id / api_hash from https://my.telegram.org → API development tools.
+    apiId: parseInt(required('TELEGRAM_API_ID'), 10),
+    apiHash: required('TELEGRAM_API_HASH'),
+    // StringSession produced once by `npm run login`. Optional only so the
+    // login script itself can run without it.
+    session: process.env.TELEGRAM_SESSION?.trim() || '',
     allowedUserIds: required('ALLOWED_USER_IDS')
       .split(',')
       .map((s) => s.trim())

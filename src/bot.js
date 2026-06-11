@@ -25,15 +25,40 @@ import { config } from './config.js';
 import { appendChat, getChat, getMemory, setMemory, getState, setState } from './store.js';
 import { generateReply, generateFollowup, updateMemory } from './llm.js';
 import { sendHumanLike, longTimeout } from './humanize.js';
-import { setReaction } from './telegram.js';
+import { setReaction, setOnline, markRead } from './telegram.js';
 import { messageToText } from './media.js';
 
-// userId -> { replyTimer, followupTimer, generation }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// userId -> { replyTimer, followupTimer, offlineTimer, generation }
 const live = new Map();
 
 function liveState(userId) {
-  if (!live.has(userId)) live.set(userId, { replyTimer: null, followupTimer: null, generation: 0 });
+  if (!live.has(userId)) {
+    live.set(userId, { replyTimer: null, followupTimer: null, offlineTimer: null, generation: 0 });
+  }
   return live.get(userId);
+}
+
+// ── Presence: the persona comes online only while actively interacting ──────
+
+function goOnline(userId) {
+  const ls = liveState(userId);
+  if (ls.offlineTimer) {
+    clearTimeout(ls.offlineTimer);
+    ls.offlineTimer = null;
+  }
+  return setOnline(true);
+}
+
+/** Linger online a short human while after the last action, then drop offline. */
+function scheduleOffline(userId) {
+  const ls = liveState(userId);
+  if (ls.offlineTimer) clearTimeout(ls.offlineTimer);
+  ls.offlineTimer = setTimeout(() => {
+    ls.offlineTimer = null;
+    setOnline(false);
+  }, 5000 + Math.random() * 25000);
 }
 
 function cancelTimers(userId) {
@@ -52,11 +77,14 @@ export async function handleIncoming(msg) {
     console.log(`[bot] ignoring message from non-allowed user ${userId}`);
     return;
   }
-  const chatId = msg.chat.id;
+  const chatId = msg.peer; // serializable { id, accessHash } peer descriptor
 
   const text = await messageToText(msg);
   console.log(`[bot] <- ${userId}: ${text.slice(0, 120)}`);
 
+  // The message is now DELIVERED but not yet read — the persona "sees" it later
+  // at answerDelay (handled in fireReply via markRead). This is what produces a
+  // realistic "delivered → read after a while → typing → reply" sequence.
   await appendChat(userId, { from: 'them', text, chatId });
 
   // A new message invalidates whatever we were about to send.
@@ -84,9 +112,15 @@ export async function handleIncoming(msg) {
     `[bot] decision for ${userId}: answerNeeded=${decision.answerNeeded} reaction=${decision.reaction ?? '-'} delay=${decision.answerDelay}s followupDelay=${decision.followupDelay}s memory=${decision.memoryUpdateNeeded}`
   );
 
-  if ((decision.answerNeeded && decision.answer) || decision.reaction) {
-    // Reaction-only decisions ride the same pending-reply pipeline with empty text.
-    await scheduleReply(userId, chatId, {
+  // Everything rides the same "seen" pipeline scheduled at answerDelay: at that
+  // moment the persona reads the message (read receipt), optionally reacts,
+  // optionally replies. Even a pure silent read goes through it (empty text, no
+  // reaction) so the read receipt still appears realistically late, then the
+  // followup is scheduled. This keeps presence/read-receipt behaviour uniform.
+  await scheduleReply(
+    userId,
+    chatId,
+    {
       text: decision.answerNeeded ? decision.answer : '',
       reaction: decision.reaction,
       messageId: msg.message_id,
@@ -95,12 +129,9 @@ export async function handleIncoming(msg) {
       followupDelay: decision.followupDelay,
       memoryUpdateNeeded: decision.memoryUpdateNeeded,
       chatId,
-    }, generation);
-  } else {
-    // Silent read — but the followup invariant still holds.
-    await scheduleFollowup(userId, chatId, decision.followup, decision.followupDelay * 1000, generation);
-    if (decision.memoryUpdateNeeded) runMemoryUpdate(userId);
-  }
+    },
+    generation
+  );
 }
 
 async function scheduleReply(userId, chatId, pending, generation) {
@@ -116,6 +147,10 @@ async function scheduleReply(userId, chatId, pending, generation) {
 }
 
 async function fireReply(userId, chatId, pending, generation) {
+  // The persona picks up the phone now: come online and read the message.
+  await goOnline(userId);
+  if (pending.messageId) await markRead(chatId, pending.messageId);
+
   if (pending.reaction && pending.messageId) {
     try {
       await setReaction(chatId, pending.messageId, pending.reaction);
@@ -133,7 +168,7 @@ async function fireReply(userId, chatId, pending, generation) {
 
   if (pending.text) {
     // Humans react first, then start typing.
-    if (pending.reaction) await new Promise((r) => setTimeout(r, 1000 + Math.random() * 2000));
+    if (pending.reaction) await sleep(1000 + Math.random() * 2000);
     const sent = await sendHumanLike(chatId, pending.text);
     for (const burst of sent) {
       await appendChat(userId, { from: 'me', text: burst, chatId });
@@ -141,6 +176,7 @@ async function fireReply(userId, chatId, pending, generation) {
     console.log(`[bot] -> ${userId}: ${pending.text.slice(0, 80)}`);
   }
 
+  scheduleOffline(userId); // linger briefly, then go offline
   await setState(userId, { pendingReply: null });
   await scheduleFollowup(userId, chatId, pending.followup, pending.followupDelay * 1000, generation);
   if (pending.memoryUpdateNeeded) runMemoryUpdate(userId);
@@ -153,10 +189,12 @@ async function scheduleFollowup(userId, chatId, text, delayMs, generation) {
   liveState(userId).followupTimer = longTimeout(async () => {
     if (liveState(userId).generation !== generation) return;
     try {
+      await goOnline(userId); // online while typing the followup
       const sent = await sendHumanLike(chatId, text);
       for (const burst of sent) {
         await appendChat(userId, { from: 'me', text: burst, chatId });
       }
+      scheduleOffline(userId);
       console.log(`[bot] -> ${userId} (followup): ${text.slice(0, 80)}`);
       await setState(userId, { pendingFollowup: null });
       // Followup invariant: immediately plan the NEXT one (scheduled, not sent).
@@ -306,10 +344,12 @@ export async function sendManual(userId, text) {
   const chat = await getChat(userId);
   const chatId = state.chatId ?? chat.at(-1)?.chatId;
   if (!chatId) throw new Error('No known chat for this contact yet');
+  await goOnline(userId);
   const sent = await sendHumanLike(chatId, text);
   for (const burst of sent) {
     await appendChat(userId, { from: 'me', text: burst, chatId });
   }
+  scheduleOffline(userId);
   return sent;
 }
 

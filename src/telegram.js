@@ -1,41 +1,98 @@
 /**
- * Minimal Telegram Bot API client (long polling, no dependencies).
+ * Telegram transport — MTProto **userbot** (a real user account, not a Bot API
+ * bot) driven by gramjs. Using a real account is what makes the persona
+ * indistinguishable: it has a genuine online/last-seen presence, real read
+ * receipts we control, no "bot" badge, and the full set of user features.
  *
- * Note on "online status": the Bot API has no concept of last-seen/online for
- * bots — Telegram clients never display a presence for bot accounts, so there
- * is nothing to fake there. What IS visible (and what we manage) is the
- * typing indicator ("... is typing"), reactions, realistic response timing,
- * and message pacing. See AGENTS.md → "Telegram realism" for the userbot
- * (MTProto) upgrade path if real last-seen simulation is ever needed.
+ * Auth: needs api_id/api_hash (from https://my.telegram.org → API development
+ * tools) and a StringSession produced once by `npm run login`. None of that is
+ * a bot token.
+ *
+ * Peers are passed around the app as a serializable descriptor
+ * `{ id, accessHash }` (the value the rest of the code calls "chatId"). It is
+ * stored in S3 state, so followups can be sent days later — even across
+ * restarts — without needing to re-resolve the entity.
  */
+import { TelegramClient, Api } from 'telegram';
+import { StringSession } from 'telegram/sessions/index.js';
+import { NewMessage } from 'telegram/events/index.js';
+import bigInt from 'big-integer';
 import { config } from './config.js';
 
-const API = `https://api.telegram.org/bot${config.telegram.token}`;
-const FILE_API = `https://api.telegram.org/file/bot${config.telegram.token}`;
+let client = null;
 
-export async function api(method, params = {}) {
-  const res = await fetch(`${API}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  });
-  const data = await res.json();
-  if (!data.ok) {
-    throw new Error(`Telegram ${method} failed: ${data.error_code} ${data.description}`);
+export function getClient() {
+  if (!client) {
+    client = new TelegramClient(
+      new StringSession(config.telegram.session),
+      config.telegram.apiId,
+      config.telegram.apiHash,
+      { connectionRetries: 5, autoReconnect: true }
+    );
+    client.setLogLevel('error'); // gramjs is very chatty at info level
   }
-  return data.result;
+  return client;
 }
 
-export function sendMessage(chatId, text) {
-  return api('sendMessage', { chat_id: chatId, text });
+/** Build an InputPeerUser from the serializable { id, accessHash } descriptor. */
+function toInputPeer(peer) {
+  if (peer instanceof Api.InputPeerUser) return peer;
+  return new Api.InputPeerUser({
+    userId: bigInt(String(peer.id)),
+    accessHash: bigInt(String(peer.accessHash ?? '0')),
+  });
 }
 
-export function sendTyping(chatId) {
-  // A single "typing" chat action shows for ~5 seconds on the client.
-  return api('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+/** Descriptor for a sender we can persist and reuse later. */
+function peerDescriptor(inputUser) {
+  return {
+    id: inputUser.userId.toString(),
+    accessHash: (inputUser.accessHash ?? bigInt(0)).toString(),
+  };
 }
 
-// Telegram only accepts reactions from this fixed emoji set.
+// ── Presence (the userbot-only superpower) ──────────────────────────────────
+
+/** Show/hide the account's "online" / "last seen" status to contacts. */
+export async function setOnline(online) {
+  try {
+    await getClient().invoke(new Api.account.UpdateStatus({ offline: !online }));
+  } catch (err) {
+    console.error('[telegram] setOnline failed:', err.message);
+  }
+}
+
+/** Mark the conversation read up to maxId — a real, controllable read receipt. */
+export async function markRead(peer, maxId) {
+  try {
+    await getClient().invoke(
+      new Api.messages.ReadHistory({ peer: toInputPeer(peer), maxId: maxId ?? 0 })
+    );
+  } catch (err) {
+    console.error('[telegram] markRead failed:', err.message);
+  }
+}
+
+// ── Sending ─────────────────────────────────────────────────────────────────
+
+export async function sendMessage(peer, text) {
+  return getClient().sendMessage(toInputPeer(peer), { message: text });
+}
+
+export async function sendTyping(peer) {
+  try {
+    await getClient().invoke(
+      new Api.messages.SetTyping({
+        peer: toInputPeer(peer),
+        action: new Api.SendMessageTypingAction(),
+      })
+    );
+  } catch {
+    /* typing is best-effort */
+  }
+}
+
+// Standard free-account reactions; user accounts can send these in private chats.
 export const ALLOWED_REACTIONS = new Set([
   '👍', '👎', '❤', '🔥', '🥰', '👏', '😁', '🤔', '🤯', '😱', '🤬', '😢', '🎉',
   '🤩', '🤮', '💩', '🙏', '👌', '🕊', '🤡', '🥱', '🥴', '😍', '🐳', '❤‍🔥',
@@ -45,7 +102,6 @@ export const ALLOWED_REACTIONS = new Set([
   '💘', '🙉', '😎', '👾', '🤷‍♂', '🤷', '🤷‍♀', '😡',
 ]);
 
-// Common LLM outputs mapped onto Telegram's allowed set.
 const REACTION_ALIASES = { '❤️': '❤', '😂': '🤣', '🙂': '👍', '😊': '🥰', '😆': '😁', '✌️': '👌' };
 
 /** Returns the normalized emoji if Telegram accepts it, else null. */
@@ -55,51 +111,80 @@ export function normalizeReaction(emoji) {
   return ALLOWED_REACTIONS.has(e) ? e : null;
 }
 
-export function setReaction(chatId, messageId, emoji) {
-  return api('setMessageReaction', {
-    chat_id: chatId,
-    message_id: messageId,
-    reaction: [{ type: 'emoji', emoji }],
-  });
+export async function setReaction(peer, messageId, emoji) {
+  await getClient().invoke(
+    new Api.messages.SendReaction({
+      peer: toInputPeer(peer),
+      msgId: messageId,
+      reaction: [new Api.ReactionEmoji({ emoticon: emoji })],
+    })
+  );
 }
 
-/** Downloads a Telegram file by file_id, returns a Buffer. */
-export async function downloadFile(fileId) {
-  const file = await api('getFile', { file_id: fileId });
-  const res = await fetch(`${FILE_API}/${file.file_path}`);
-  if (!res.ok) throw new Error(`Telegram file download failed: ${res.status}`);
-  return Buffer.from(await res.arrayBuffer());
+// ── Incoming media ──────────────────────────────────────────────────────────
+
+/** Downloads the media of a raw gramjs message, returns a Buffer. */
+export async function downloadMedia(rawMessage) {
+  return getClient().downloadMedia(rawMessage, {});
+}
+
+function voiceDuration(message) {
+  const doc = message.voice;
+  const attr = doc?.attributes?.find((a) => a instanceof Api.DocumentAttributeAudio);
+  return attr?.duration ?? 0;
 }
 
 /**
- * Long-polls getUpdates forever and invokes onMessage(msg) for every
- * incoming private message containing text, a photo or a voice note.
+ * Normalizes a raw gramjs message into the shape the rest of the app uses.
+ * In MTProto a media message's caption lives in `message.message`.
  */
-export async function startPolling(onMessage) {
-  // Drop any webhook so getUpdates works.
-  await api('deleteWebhook', { drop_pending_updates: false }).catch(() => {});
-  let offset = 0;
-  console.log('[telegram] long polling started');
-  for (;;) {
-    try {
-      const updates = await api('getUpdates', {
-        offset,
-        timeout: 50,
-        allowed_updates: ['message'],
-      });
-      for (const update of updates) {
-        offset = update.update_id + 1;
-        const msg = update.message;
-        const hasContent = msg && (msg.text || msg.photo?.length || msg.voice);
-        if (hasContent && msg.chat?.type === 'private') {
-          Promise.resolve(onMessage(msg)).catch((err) =>
-            console.error('[telegram] onMessage error:', err)
-          );
-        }
-      }
-    } catch (err) {
-      console.error('[telegram] polling error, retrying in 5s:', err.message);
-      await new Promise((r) => setTimeout(r, 5000));
-    }
+async function normalize(message) {
+  const inputSender = await message.getInputSender(); // Api.InputPeerUser (id + accessHash)
+  const peer = peerDescriptor(inputSender);
+  const isPhoto = Boolean(message.photo);
+  const isVoice = Boolean(message.voice);
+  const hasMedia = isPhoto || isVoice;
+  return {
+    message_id: message.id,
+    from: { id: peer.id },
+    peer, // serializable; used everywhere as "chatId"
+    text: hasMedia ? '' : message.message || '',
+    caption: hasMedia ? message.message || '' : '',
+    isPhoto,
+    voice: isVoice ? { duration: voiceDuration(message) } : null,
+    raw: message,
+  };
+}
+
+// ── Lifecycle ───────────────────────────────────────────────────────────────
+
+/**
+ * Connects the userbot, registers the incoming-message handler, and starts
+ * "offline" (presence is then driven explicitly when the persona interacts).
+ * onMessage receives the normalized message object.
+ */
+export async function start(onMessage) {
+  const c = getClient();
+  await c.connect();
+  if (!(await c.checkAuthorization())) {
+    throw new Error(
+      'Telegram session is not authorized. Run `npm run login` to create TELEGRAM_SESSION.'
+    );
   }
+  const me = await c.getMe();
+  console.log(`[telegram] userbot connected as ${me.firstName ?? ''} (id ${me.id})`);
+
+  // Don't broadcast online just because we connected.
+  await setOnline(false);
+
+  c.addEventHandler(async (event) => {
+    try {
+      const msg = await normalize(event.message);
+      await onMessage(msg);
+    } catch (err) {
+      console.error('[telegram] onMessage error:', err);
+    }
+  }, new NewMessage({ incoming: true }));
+
+  console.log('[telegram] listening for incoming messages');
 }
