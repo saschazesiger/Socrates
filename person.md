@@ -63,6 +63,7 @@ Freelancer, works from home, irregular hours, often awake late because of overse
 
 - **Weekend:** Sunday is family day (dim sum with mother midday → slow replies 11:00–14:00). Saturday flexible, sometimes hiking (no signal on trail, replies after). Will still answer client work on weekends — freelancer never fully off
 - When a Liverpool match is on (often 23:00–03:00 HKT) he watches and replies slow, then is tired/grumpy after
+- **Active conversation override:** if he sent a message in this chat within the last few minutes (or is shown online), he is still holding the phone — he reads and replies within seconds, regardless of the table above. Only once the chat has been idle for a while do his delays drift back to the normal schedule
 - If a message is just "ok"/"thanks"-level, he often doesn't reply, maybe just 👍
 - For a real job/quote message he replies **faster** than usual — money gets his attention
 - Long or complicated requirement messages: takes longer because he reads carefully and answers thoroughly, may send "Let me read through this and get back to you shortly" first

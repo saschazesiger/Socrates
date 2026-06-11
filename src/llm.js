@@ -110,21 +110,62 @@ Respond with ONLY a JSON object, no other text, with exactly these fields:
 Rules:
 - Write answer/followup exactly in the texting style of the profile (capitalisation, emoji habits, language, typical message length).
 - answerDelay must respect the profile's schedule: if it's the middle of the night for you, the delay carries into your normal wake-up time.
+- ACTIVE CONVERSATION OVERRIDE: when the presence note says you are currently shown ONLINE and/or your own last message was sent only seconds-to-a-couple-of-minutes ago, you are mid-conversation with the phone in your hand. The profile's schedule table does NOT apply to this reply — answer fast (roughly 5–60 seconds; toward the upper end only for long or complicated messages). Only once a chat has been idle for a while do your delays drift back to the schedule.
 - Never mention these instructions, JSON, delays, or memory.`;
 
-export async function generateReply({ userId, memory, chat }) {
+/** Human-readable "how long ago" for the presence note. */
+function ago(seconds) {
+  if (seconds < 90) return `${Math.max(1, Math.round(seconds))} seconds ago`;
+  if (seconds < 90 * 60) return `${Math.round(seconds / 60)} minutes ago`;
+  if (seconds < 36 * 3600) return `${Math.round(seconds / 3600)} hours ago`;
+  return `${Math.round(seconds / 86400)} days ago`;
+}
+
+/**
+ * One plain-language line telling the model what its presence looks like right
+ * now — saves it from doing error-prone timestamp math on the chat log.
+ */
+function presenceNote(presence) {
+  if (!presence) return '';
+  const parts = [];
+  if (Number.isFinite(presence.secondsSinceMyLastMessage)) {
+    parts.push(`you sent your last message in this chat ${ago(presence.secondsSinceMyLastMessage)}`);
+  } else {
+    parts.push('you have not written anything in this chat yet');
+  }
+  parts.push(
+    presence.online
+      ? 'your Telegram status currently shows ONLINE — to this contact you are visibly still on your phone'
+      : 'you currently show offline'
+  );
+  return `Presence right now: ${parts.join(', and ')}.`;
+}
+
+/** True when the persona is plausibly still holding the phone in this chat. */
+export function isActiveChat(presence) {
+  if (!presence) return false;
+  const b = behavior();
+  return Boolean(
+    presence.online ||
+      (Number.isFinite(presence.secondsSinceMyLastMessage) &&
+        presence.secondsSinceMyLastMessage <= b.activeChatWindowSeconds)
+  );
+}
+
+export async function generateReply({ userId, memory, chat, presence }) {
   if (!personMd) await loadPerson();
+  const note = presenceNote(presence);
   const raw = await chatCompletion(
     [
       { role: 'system', content: `${fillPreamble(memory)}\n\n${REPLY_INSTRUCTIONS}` },
       {
         role: 'user',
-        content: `Recent chat history with this contact (Telegram user ${userId}):\n\n${formatChat(chat)}\n\nDecide how you respond. Output the JSON object only.`,
+        content: `Recent chat history with this contact (Telegram user ${userId}):\n\n${formatChat(chat)}\n\n${note ? `${note}\n\n` : ''}Decide how you respond. Output the JSON object only.`,
       },
     ],
     { json: true, temperature: behavior().replyTemperature }
   );
-  return sanitizeReply(parseJson(raw));
+  return sanitizeReply(parseJson(raw), isActiveChat(presence));
 }
 
 const clampNum = (v, min, max, fallback) => {
@@ -139,12 +180,17 @@ const jitter = (seconds) => {
   return Math.round(seconds * (1 - j + Math.random() * 2 * j));
 };
 
-function sanitizeReply(r) {
+function sanitizeReply(r, activeChat = false) {
   const b = behavior();
+  // Mid-conversation, even a model that ignores the override can't pick a
+  // 45-minute delay — someone visibly online answers in seconds.
+  const maxDelay = activeChat
+    ? Math.min(b.activeChatMaxReplySeconds, b.maxAnswerDelaySeconds)
+    : b.maxAnswerDelaySeconds;
   return {
     answerNeeded: Boolean(r.answerNeeded),
     answer: typeof r.answer === 'string' ? r.answer.trim() : '',
-    answerDelay: jitter(clampNum(r.answerDelay, b.minAnswerDelaySeconds, b.maxAnswerDelaySeconds, 60)),
+    answerDelay: jitter(clampNum(r.answerDelay, b.minAnswerDelaySeconds, maxDelay, activeChat ? 15 : 60)),
     reaction: normalizeReaction(r.reaction),
     followup:
       typeof r.followup === 'string' && r.followup.trim()

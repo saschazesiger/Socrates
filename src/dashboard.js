@@ -76,6 +76,8 @@ const BEHAVIOR_NUM_KEYS = [
   'burstGapMaxMs',
   'onlineLingerMinMs',
   'onlineLingerMaxMs',
+  'activeChatWindowSeconds',
+  'activeChatMaxReplySeconds',
   'answerDelayJitter',
   'minAnswerDelaySeconds',
   'maxAnswerDelaySeconds',
@@ -658,6 +660,8 @@ async function renderSettings(root){
     + numField('burstGapMaxMs','Burst gap max (ms)','100')
     + numField('onlineLingerMinMs','Online linger min (ms)','500')
     + numField('onlineLingerMaxMs','Online linger max (ms)','500')
+    + numField('activeChatWindowSeconds','Active-chat window (s)','10')
+    + numField('activeChatMaxReplySeconds','Active-chat max reply delay (s)','5')
     + numField('answerDelayJitter','Answer delay jitter (±frac)','0.01')
     + numField('minAnswerDelaySeconds','Min answer delay (s)','1')
     + numField('maxAnswerDelaySeconds','Max answer delay (s)','60')
@@ -678,7 +682,7 @@ window.removeId = function(id){ settings.allowedUserIds = (settings.allowedUserI
 
 window.saveSettings = async function(){
   var b = {};
-  ['typoProbability','replyTemperature','typingCharsPerSecMin','typingCharsPerSecMax','typingMaxSeconds','typingPauseChance','burstGapMinMs','burstGapMaxMs','onlineLingerMinMs','onlineLingerMaxMs','answerDelayJitter','minAnswerDelaySeconds','maxAnswerDelaySeconds'].forEach(function(k){ b[k] = Number($('#b_'+k).value); });
+  ['typoProbability','replyTemperature','typingCharsPerSecMin','typingCharsPerSecMax','typingMaxSeconds','typingPauseChance','burstGapMinMs','burstGapMaxMs','onlineLingerMinMs','onlineLingerMaxMs','activeChatWindowSeconds','activeChatMaxReplySeconds','answerDelayJitter','minAnswerDelaySeconds','maxAnswerDelaySeconds'].forEach(function(k){ b[k] = Number($('#b_'+k).value); });
   b.paused = $('#paused').checked;
   var model = $('#modelCustom').value.trim() || $('#modelSel').value;
   var mediaModel = $('#mediaCustom').value.trim() || $('#mediaSel').value;

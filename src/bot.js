@@ -35,12 +35,12 @@ import { isAllowed, configuredUserIds, behavior } from './settings.js';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const PAUSE_RECHECK_MS = 30 * 1000;
 
-// userId -> { replyTimer, followupTimer, offlineTimer, generation }
+// userId -> { replyTimer, followupTimer, offlineTimer, online, generation }
 const live = new Map();
 
 function liveState(userId) {
   if (!live.has(userId)) {
-    live.set(userId, { replyTimer: null, followupTimer: null, offlineTimer: null, generation: 0 });
+    live.set(userId, { replyTimer: null, followupTimer: null, offlineTimer: null, online: false, generation: 0 });
   }
   return live.get(userId);
 }
@@ -60,6 +60,7 @@ function goOnline(userId) {
     clearTimeout(ls.offlineTimer);
     ls.offlineTimer = null;
   }
+  ls.online = true;
   return setOnline(true);
 }
 
@@ -70,6 +71,7 @@ function scheduleOffline(userId) {
   if (ls.offlineTimer) clearTimeout(ls.offlineTimer);
   ls.offlineTimer = setTimeout(() => {
     ls.offlineTimer = null;
+    ls.online = false;
     setOnline(false);
   }, b.onlineLingerMinMs + Math.random() * (b.onlineLingerMaxMs - b.onlineLingerMinMs));
 }
@@ -105,12 +107,24 @@ export async function handleIncoming(msg) {
   const generation = ls.generation;
   await setState(userId, { pendingReply: null, pendingFollowup: null, chatId });
 
+  // Presence snapshot for the LLM: is the persona visibly online right now,
+  // and how long ago did it last write in this chat? "30 seconds ago" means
+  // still on the phone — the model is told so in plain language instead of
+  // having to do timestamp math on the log.
+  const chat = await getChat(userId);
+  const lastMine = chat.findLast((e) => e.from === 'me');
+  const presence = {
+    online: ls.online,
+    secondsSinceMyLastMessage: lastMine ? (Date.now() - Date.parse(lastMine.ts)) / 1000 : null,
+  };
+
   let decision;
   try {
     decision = await generateReply({
       userId,
       memory: await getMemory(userId),
-      chat: await getChat(userId),
+      chat,
+      presence,
     });
   } catch (err) {
     console.error(`[bot] LLM error for ${userId}:`, err.message);
@@ -122,8 +136,20 @@ export async function handleIncoming(msg) {
   if (liveState(userId).generation !== generation) return;
 
   console.log(
-    `[bot] decision for ${userId}: answerNeeded=${decision.answerNeeded} reaction=${decision.reaction ?? '-'} delay=${decision.answerDelay}s followupDelay=${decision.followupDelay}s memory=${decision.memoryUpdateNeeded}`
+    `[bot] decision for ${userId}: answerNeeded=${decision.answerNeeded} reaction=${decision.reaction ?? '-'} delay=${decision.answerDelay}s followupDelay=${decision.followupDelay}s memory=${decision.memoryUpdateNeeded} online=${presence.online}`
   );
+
+  // Still on the phone: visibly online with a reply due in moments means the
+  // chat is open — stay online (instead of dropping off mid-conversation) and
+  // read the message immediately, like a person watching the thread.
+  if (liveState(userId).online && decision.answerDelay <= behavior().activeChatMaxReplySeconds * 1.5) {
+    await goOnline(userId); // cancels the pending offline drop
+    try {
+      if (msg.message_id) await markRead(chatId, msg.message_id);
+    } catch (err) {
+      console.error(`[bot] immediate read failed for ${userId}:`, err.message);
+    }
+  }
 
   // Everything rides the same "seen" pipeline scheduled at answerDelay: at that
   // moment the persona reads the message (read receipt), optionally reacts,
@@ -471,6 +497,10 @@ export async function pruneContact(userId, parts = { chat: true, memory: true, s
   if (ls.offlineTimer) {
     clearTimeout(ls.offlineTimer);
     ls.offlineTimer = null;
+  }
+  if (ls.online) {
+    ls.online = false;
+    setOnline(false).catch(() => {});
   }
   await resetContact(userId, parts);
   return { ...parts };

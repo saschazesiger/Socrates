@@ -93,6 +93,7 @@ is the source of truth and the env values are ignored.
     "typingCharsPerSecMin": 4, "typingCharsPerSecMax": 7, "typingMaxSeconds": 45,
     "burstGapMinMs": 800, "burstGapMaxMs": 2500,
     "onlineLingerMinMs": 5000, "onlineLingerMaxMs": 30000,
+    "activeChatWindowSeconds": 180, "activeChatMaxReplySeconds": 90,
     "answerDelayJitter": 0.12,
     "minAnswerDelaySeconds": 2, "maxAnswerDelaySeconds": 50400,
     "replyTemperature": 0.9
@@ -103,7 +104,7 @@ is the source of truth and the env values are ignored.
 - **session** — read by `telegram.js` `getClient()`. Changing it (dashboard login or logout) calls `restart()`, which tears down the MTProto connection and reconnects with the new session, re-using the same message handler. The userbot start is **non-fatal** when no session is authorised yet, so the HTTP server + dashboard stay up for the login flow.
 - **allowedUserIds / allowAll** — checked by `isAllowed()` on every incoming message. With `allowAll`, contacts the persona has never been configured for are discovered dynamically by listing S3 (`store.listContactIds`), so they still appear in the dashboard and get followups/restored timers.
 - **model / mediaModel** — resolved in `llm.chatCompletion` and `media.js`. The dashboard model picker is populated from OpenRouter's live `/models` catalogue (`llm.listModels`), with a free-text fallback for any slug.
-- **behavior** — read live by `humanize.js` (typing/typo/bursts), `bot.js` (online linger, pause), and `llm.js` (delay jitter/clamps, reply temperature). `paused` holds scheduled replies/followups (re-checked every 30s) without dropping them; manual dashboard sends still go out.
+- **behavior** — read live by `humanize.js` (typing/typo/bursts), `bot.js` (online linger, pause, active-chat read-now), and `llm.js` (delay jitter/clamps, active-chat detection, reply temperature). `paused` holds scheduled replies/followups (re-checked every 30s) without dropping them; manual dashboard sends still go out. `activeChatWindowSeconds`/`activeChatMaxReplySeconds` define the "still on the phone" mode (see Timing & presence below).
 
 ## Persistent data (S3 layout)
 
@@ -139,7 +140,7 @@ Every incoming message triggers one OpenRouter call. The model answers with **on
 ```
 
 - **answerNeeded** — `false` when a real person would simply not reply (bare "ok", "👍", etc.). A followup is still scheduled.
-- **answerDelay** (seconds) — when the person would realistically *see and handle* the message, derived from the profile's reply-behaviour table, the current local time, and the message's length/complexity. Night message → delay carries into wake-up time (e.g. 25200s). Evening banter → 5–60s. Sanitized in code to 2s…14h, with ±12% jitter so delays never form a statistical fingerprint.
+- **answerDelay** (seconds) — when the person would realistically *see and handle* the message, derived from the profile's reply-behaviour table, the current local time, and the message's length/complexity. Night message → delay carries into wake-up time (e.g. 25200s). Evening banter → 5–60s. Sanitized in code to 2s…14h, with ±12% jitter so delays never form a statistical fingerprint. **Active conversation:** every reply call includes a plain-language presence note ("you sent your last message 30 seconds ago, and your status shows ONLINE") so the model never has to do timestamp math; when the persona is online or wrote within `activeChatWindowSeconds`, the instructions override the schedule table (reply in seconds) and the delay is additionally hard-capped at `activeChatMaxReplySeconds`.
 - **reaction** — optional emoji reaction to the incoming message (Telegram's reaction feature), applied at `answerDelay` time just before typing starts. Normalized against Telegram's fixed allowed-reaction set in `src/telegram.js` (`❤️→❤`, `😂→🤣`, invalid → dropped). Reaction-only responses (react, no text) are fully supported.
 - **followup / followupDelay** — the message sent if the contact stays silent. Minutes-to-hours for an unanswered question ("und?"), days-to-a-week for a fresh check-in after a conversation ended. Sanitized to 5min…14d.
 - **memoryUpdateNeeded** — triggers a separate LLM call (`updateMemory`) that rewrites `memory.txt` from the current memory + chat.jsonl.
@@ -164,6 +165,7 @@ Contacts with zero chat history are never cold-opened by the guard.
 - **Everything is scheduled at `answerDelay`** via one unified "seen" path (`fireReply`), even a pure silent read (empty text, no reaction). At that moment the persona: comes **online** (`setOnline(true)`), **marks the message read** (`markRead`), optionally **reacts**, optionally **types and replies**, then **lingers online 5–30s and goes offline**. So even "leaving it on read" is modelled: the read receipt shows up `answerDelay` after delivery with no reply.
 - Replies show **typing** for a duration proportional to the text length (~4–7 chars/sec, capped at 45s), then send. Multi-paragraph answers are sent as separate burst messages with 0.8–2.5s gaps and their own typing periods.
 - **Presence is interaction-scoped.** The account is offline by default and only goes online while actively reading/typing/sending (replies, followups, and dashboard manual sends). A per-user offline timer (reset on each action) drops it back offline shortly after, so it never looks permanently online.
+- **Active conversation ("still on the phone").** When a message arrives while the persona is visibly online, or within `activeChatWindowSeconds` of its own last message, the reply call is flagged as mid-conversation: the LLM is told its live presence, instructed to ignore the schedule table, and the chosen delay is hard-capped at `activeChatMaxReplySeconds`. If the persona is online and the reply is due in moments, it *stays* online and marks the message read immediately (chat open, instant read receipt) instead of dropping offline mid-exchange — so rapid back-and-forth produces one continuous online session that ends shortly after the last message.
 - ~7% of sends introduce one realistic adjacent-letter typo in a word, followed 1.5–5s later by the classic `*correctword` message. At most one typo per send.
 - Every sent burst (including corrections and reactions) is appended to chat.jsonl as `from: "me"`, so the next LLM call sees exactly what was actually said.
 
@@ -229,7 +231,7 @@ Operational caveat of using a real account: automating a user account is against
 2. **Personality** — temperament, humour, conversational habits (counter-questions? deflection?).
 3. **Hobbies & life** — weekly schedule anchors (training days, match days) that explain unavailability; family/friend names the person would naturally mention.
 4. **Texting style** — the most important section for believability. Capitalisation, punctuation, dialect/language, emoji habits (which ones, how often), reaction habits (which emojis they tap on messages), typical message length, filler words, how typos are handled. Give literal example phrases.
-5. **Reply behaviour & availability** — a time-of-day table: sleep window, work blocks, commute, free evenings, weekend differences, recurring events. This is what the LLM uses to compute `answerDelay`. Be specific ("asleep 23:30–07:00, replies ~07:15") not vague ("sleeps at night").
+5. **Reply behaviour & availability** — a time-of-day table: sleep window, work blocks, commute, free evenings, weekend differences, recurring events. This is what the LLM uses to compute `answerDelay`. Be specific ("asleep 23:30–07:00, replies ~07:15") not vague ("sleeps at night"). Include an active-conversation bullet ("if he wrote in the chat moments ago he's still on the phone and replies in seconds") so the profile agrees with the built-in active-chat override.
 6. **Followup behaviour** — does the person poke when ignored? How fast? How do they resurface after days (link, question about a mentioned plan)?
 7. **Hard boundaries** — always include: never admit being an AI (and how to react to accusations), no assistant-style output, no knowledge the person wouldn't have, deflections for media requests (photos/voice) and real-world favours.
 

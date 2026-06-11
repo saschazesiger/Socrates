@@ -42,6 +42,13 @@ export const DEFAULT_BEHAVIOR = {
   // How long the account lingers "online" after acting before going offline.
   onlineLingerMinMs: 5000,
   onlineLingerMaxMs: 30000,
+  // "Still on the phone": if the persona's own last message in this chat is
+  // more recent than this, an incoming reply counts as an active conversation —
+  // the LLM is told it's mid-chat and the schedule table doesn't apply.
+  activeChatWindowSeconds: 180,
+  // Hard cap on answerDelay while in an active conversation (someone holding
+  // the phone never takes 45 minutes to answer).
+  activeChatMaxReplySeconds: 90,
   // ± fraction of random jitter applied to every LLM-chosen delay so they never
   // form a statistical fingerprint.
   answerDelayJitter: 0.12,
