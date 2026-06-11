@@ -3,20 +3,30 @@
  *
  * Flow per incoming message:
  *   1. Ignore senders not in ALLOWED_USER_IDS.
- *   2. Append message to chat.jsonl (append + trim in one function).
- *   3. Cancel any pending reply/followup — a new message changes the situation,
+ *   2. Resolve media (photo description / voice transcript) to text.
+ *   3. Append to chat.jsonl (append + trim in one function).
+ *   4. Cancel any pending reply/followup — a new message changes the situation,
  *      exactly like a human would re-think what to say.
- *   4. Ask OpenRouter for the structured decision (answer, delays, followup, …).
- *   5. Schedule the answer after answerDelay; on send, schedule the followup.
- *   6. If memoryUpdateNeeded, distill chat.jsonl into memory.txt.
+ *   5. Ask OpenRouter for the structured decision (answer, reaction, delays, followup, …).
+ *   6. Schedule the answer (and/or emoji reaction) after answerDelay; on send,
+ *      schedule the followup.
+ *   7. If memoryUpdateNeeded, distill chat.jsonl into memory.txt.
+ *
+ * Followup invariant: every contact with chat history ALWAYS has a pending
+ * followup. After a followup fires, the next one is generated immediately
+ * (scheduled, not sent). A guard tick runs hourly and backfills a followup
+ * for any contact that somehow has none — so the persona keeps initiating
+ * contact naturally, never via a visible schedule.
  *
  * Pending timers are persisted to state.json in S3, so a "reply in 7 hours"
  * or a "check in next week" followup survives restarts and redeploys.
  */
 import { config } from './config.js';
 import { appendChat, getChat, getMemory, setMemory, getState, setState } from './store.js';
-import { generateReply, updateMemory } from './llm.js';
+import { generateReply, generateFollowup, updateMemory } from './llm.js';
 import { sendHumanLike, longTimeout } from './humanize.js';
+import { setReaction } from './telegram.js';
+import { messageToText } from './media.js';
 
 // userId -> { replyTimer, followupTimer, generation }
 const live = new Map();
@@ -43,9 +53,11 @@ export async function handleIncoming(msg) {
     return;
   }
   const chatId = msg.chat.id;
-  console.log(`[bot] <- ${userId}: ${msg.text}`);
 
-  await appendChat(userId, { from: 'them', text: msg.text, chatId });
+  const text = await messageToText(msg);
+  console.log(`[bot] <- ${userId}: ${text.slice(0, 120)}`);
+
+  await appendChat(userId, { from: 'them', text, chatId });
 
   // A new message invalidates whatever we were about to send.
   const ls = cancelTimers(userId);
@@ -69,72 +81,133 @@ export async function handleIncoming(msg) {
   if (liveState(userId).generation !== generation) return;
 
   console.log(
-    `[bot] decision for ${userId}: answerNeeded=${decision.answerNeeded} delay=${decision.answerDelay}s followupDelay=${decision.followupDelay}s memory=${decision.memoryUpdateNeeded}`
+    `[bot] decision for ${userId}: answerNeeded=${decision.answerNeeded} reaction=${decision.reaction ?? '-'} delay=${decision.answerDelay}s followupDelay=${decision.followupDelay}s memory=${decision.memoryUpdateNeeded}`
   );
 
-  if (decision.answerNeeded && decision.answer) {
-    await scheduleReply(userId, chatId, decision, generation);
-  } else {
-    // No reply — but a followup is still always scheduled (e.g. silent read,
-    // then a fresh ping later).
-    await scheduleFollowup(userId, chatId, decision.followup, decision.followupDelay, generation);
-    if (decision.memoryUpdateNeeded) runMemoryUpdate(userId);
-  }
-}
-
-async function scheduleReply(userId, chatId, decision, generation) {
-  const dueAt = Date.now() + decision.answerDelay * 1000;
-  await setState(userId, {
-    pendingReply: {
-      text: decision.answer,
-      dueAt,
+  if ((decision.answerNeeded && decision.answer) || decision.reaction) {
+    // Reaction-only decisions ride the same pending-reply pipeline with empty text.
+    await scheduleReply(userId, chatId, {
+      text: decision.answerNeeded ? decision.answer : '',
+      reaction: decision.reaction,
+      messageId: msg.message_id,
+      dueAt: Date.now() + decision.answerDelay * 1000,
       followup: decision.followup,
       followupDelay: decision.followupDelay,
       memoryUpdateNeeded: decision.memoryUpdateNeeded,
       chatId,
-    },
-  });
+    }, generation);
+  } else {
+    // Silent read — but the followup invariant still holds.
+    await scheduleFollowup(userId, chatId, decision.followup, decision.followupDelay * 1000, generation);
+    if (decision.memoryUpdateNeeded) runMemoryUpdate(userId);
+  }
+}
 
+async function scheduleReply(userId, chatId, pending, generation) {
+  await setState(userId, { pendingReply: pending });
   liveState(userId).replyTimer = longTimeout(async () => {
     if (liveState(userId).generation !== generation) return;
     try {
-      await fireReply(userId, chatId, decision, generation);
+      await fireReply(userId, chatId, pending, generation);
     } catch (err) {
       console.error(`[bot] failed to send reply to ${userId}:`, err.message);
     }
-  }, dueAt - Date.now());
+  }, pending.dueAt - Date.now());
 }
 
-async function fireReply(userId, chatId, decision, generation) {
-  const bursts = await sendHumanLike(chatId, decision.answer);
-  for (const burst of bursts) {
-    await appendChat(userId, { from: 'me', text: burst, chatId });
+async function fireReply(userId, chatId, pending, generation) {
+  if (pending.reaction && pending.messageId) {
+    try {
+      await setReaction(chatId, pending.messageId, pending.reaction);
+      await appendChat(userId, {
+        from: 'me',
+        text: `[reacted ${pending.reaction} to their message]`,
+        type: 'reaction',
+        chatId,
+      });
+      console.log(`[bot] -> ${userId}: reacted ${pending.reaction}`);
+    } catch (err) {
+      console.error(`[bot] reaction failed for ${userId}:`, err.message);
+    }
   }
-  console.log(`[bot] -> ${userId}: ${decision.answer.slice(0, 80)}`);
-  await setState(userId, { pendingReply: null });
 
-  await scheduleFollowup(userId, chatId, decision.followup, decision.followupDelay, generation);
-  if (decision.memoryUpdateNeeded) runMemoryUpdate(userId);
+  if (pending.text) {
+    // Humans react first, then start typing.
+    if (pending.reaction) await new Promise((r) => setTimeout(r, 1000 + Math.random() * 2000));
+    const sent = await sendHumanLike(chatId, pending.text);
+    for (const burst of sent) {
+      await appendChat(userId, { from: 'me', text: burst, chatId });
+    }
+    console.log(`[bot] -> ${userId}: ${pending.text.slice(0, 80)}`);
+  }
+
+  await setState(userId, { pendingReply: null });
+  await scheduleFollowup(userId, chatId, pending.followup, pending.followupDelay * 1000, generation);
+  if (pending.memoryUpdateNeeded) runMemoryUpdate(userId);
 }
 
-async function scheduleFollowup(userId, chatId, text, delaySeconds, generation) {
-  const dueAt = Date.now() + delaySeconds * 1000;
+async function scheduleFollowup(userId, chatId, text, delayMs, generation) {
+  const dueAt = Date.now() + delayMs;
   await setState(userId, { pendingFollowup: { text, dueAt, chatId } });
 
   liveState(userId).followupTimer = longTimeout(async () => {
     if (liveState(userId).generation !== generation) return;
     try {
-      const bursts = await sendHumanLike(chatId, text);
-      for (const burst of bursts) {
+      const sent = await sendHumanLike(chatId, text);
+      for (const burst of sent) {
         await appendChat(userId, { from: 'me', text: burst, chatId });
       }
       console.log(`[bot] -> ${userId} (followup): ${text.slice(0, 80)}`);
       await setState(userId, { pendingFollowup: null });
-      // One followup per cycle; after that we wait for them. No infinite nagging.
+      // Followup invariant: immediately plan the NEXT one (scheduled, not sent).
+      // The LLM sees the growing run of unanswered messages and naturally
+      // spaces them out further / changes topic — no clinginess.
+      await chainNextFollowup(userId, chatId, generation);
     } catch (err) {
       console.error(`[bot] failed to send followup to ${userId}:`, err.message);
     }
   }, dueAt - Date.now());
+}
+
+async function chainNextFollowup(userId, chatId, generation) {
+  try {
+    const next = await generateFollowup({
+      userId,
+      memory: await getMemory(userId),
+      chat: await getChat(userId),
+    });
+    if (liveState(userId).generation !== generation) return; // they replied meanwhile
+    console.log(`[bot] next followup for ${userId} in ${Math.round(next.followupDelay / 3600)}h`);
+    await scheduleFollowup(userId, chatId, next.followup, next.followupDelay * 1000, generation);
+  } catch (err) {
+    console.error(`[bot] followup generation failed for ${userId}:`, err.message);
+    // The hourly guard will retry.
+  }
+}
+
+/**
+ * Hourly guard: every contact with chat history must always have something
+ * pending. If neither a reply nor a followup is scheduled (e.g. after an
+ * error, or legacy state), generate a followup now — scheduled, never sent
+ * directly, so nothing ever feels like a cron job.
+ */
+export async function followupGuardTick() {
+  for (const userId of config.telegram.allowedUserIds) {
+    try {
+      const ls = liveState(userId);
+      if (ls.replyTimer || ls.followupTimer) continue;
+      const state = await getState(userId);
+      if (state.pendingReply || state.pendingFollowup) continue;
+      const chat = await getChat(userId);
+      if (!chat.length) continue; // never cold-open a contact we've never talked to
+      const chatId = state.chatId ?? chat.at(-1)?.chatId;
+      if (!chatId) continue;
+      console.log(`[bot] followup guard: planning followup for ${userId}`);
+      await chainNextFollowup(userId, chatId, ls.generation);
+    } catch (err) {
+      console.error(`[bot] followup guard failed for ${userId}:`, err.message);
+    }
+  }
 }
 
 function runMemoryUpdate(userId) {
@@ -172,28 +245,21 @@ export async function restorePendingTimers() {
       console.log(`[bot] restoring pending reply for ${userId} in ${Math.round(delay / 1000)}s`);
       ls.replyTimer = longTimeout(async () => {
         if (liveState(userId).generation !== generation) return;
-        await fireReply(
-          userId,
-          p.chatId,
-          {
-            answer: p.text,
-            followup: p.followup,
-            followupDelay: p.followupDelay,
-            memoryUpdateNeeded: p.memoryUpdateNeeded,
-          },
-          generation
-        ).catch((err) => console.error(`[bot] restored reply failed:`, err.message));
+        await fireReply(userId, p.chatId, p, generation).catch((err) =>
+          console.error(`[bot] restored reply failed:`, err.message)
+        );
       }, delay);
     } else if (state.pendingFollowup) {
       const p = state.pendingFollowup;
       const delay = Math.max(p.dueAt - Date.now(), 5000 + Math.random() * 60000);
       console.log(`[bot] restoring pending followup for ${userId} in ${Math.round(delay / 1000)}s`);
-      await scheduleFollowup(userId, p.chatId, p.text, delay / 1000, generation);
+      await scheduleFollowup(userId, p.chatId, p.text, delay, generation);
     }
   }
 }
 
-/** Snapshot for the /status endpoint. */
+// ── Dashboard operations ───────────────────────────────────────────────────
+
 export async function statusSnapshot() {
   const users = {};
   for (const userId of config.telegram.allowedUserIds) {
@@ -202,11 +268,71 @@ export async function statusSnapshot() {
     users[userId] = {
       messagesInLog: chat.length,
       lastMessageAt: chat.at(-1)?.ts ?? null,
-      pendingReplyDueAt: state.pendingReply ? new Date(state.pendingReply.dueAt).toISOString() : null,
-      pendingFollowupDueAt: state.pendingFollowup
-        ? new Date(state.pendingFollowup.dueAt).toISOString()
+      lastMessageFrom: chat.at(-1)?.from ?? null,
+      pendingReply: state.pendingReply
+        ? {
+            text: state.pendingReply.text,
+            reaction: state.pendingReply.reaction ?? null,
+            dueAt: new Date(state.pendingReply.dueAt).toISOString(),
+          }
+        : null,
+      pendingFollowup: state.pendingFollowup
+        ? {
+            text: state.pendingFollowup.text,
+            dueAt: new Date(state.pendingFollowup.dueAt).toISOString(),
+          }
         : null,
     };
   }
   return users;
+}
+
+export async function cancelPending(userId, kind) {
+  const ls = liveState(userId);
+  if (kind === 'reply') {
+    ls.replyTimer?.cancel();
+    ls.replyTimer = null;
+    await setState(userId, { pendingReply: null });
+  } else if (kind === 'followup') {
+    ls.followupTimer?.cancel();
+    ls.followupTimer = null;
+    await setState(userId, { pendingFollowup: null });
+  }
+}
+
+/** Sends a manual message as the persona (human-like) and logs it. */
+export async function sendManual(userId, text) {
+  const state = await getState(userId);
+  const chat = await getChat(userId);
+  const chatId = state.chatId ?? chat.at(-1)?.chatId;
+  if (!chatId) throw new Error('No known chat for this contact yet');
+  const sent = await sendHumanLike(chatId, text);
+  for (const burst of sent) {
+    await appendChat(userId, { from: 'me', text: burst, chatId });
+  }
+  return sent;
+}
+
+/** Discards the pending followup (if any) and plans a fresh one. */
+export async function regenerateFollowup(userId) {
+  const state = await getState(userId);
+  const chat = await getChat(userId);
+  const chatId = state.chatId ?? chat.at(-1)?.chatId;
+  if (!chatId) throw new Error('No known chat for this contact yet');
+  const ls = liveState(userId);
+  ls.followupTimer?.cancel();
+  ls.followupTimer = null;
+  await setState(userId, { pendingFollowup: null });
+  await chainNextFollowup(userId, chatId, ls.generation);
+  return (await getState(userId)).pendingFollowup;
+}
+
+/** Forces a memory distillation right now; returns the new memory text. */
+export async function forceMemoryUpdate(userId) {
+  const newMemory = await updateMemory({
+    memory: await getMemory(userId),
+    chat: await getChat(userId),
+  });
+  await setMemory(userId, newMemory);
+  return newMemory;
 }

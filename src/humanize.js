@@ -1,7 +1,8 @@
 /**
  * Everything that makes the bot's Telegram behaviour feel like a human:
  * typing indicators proportional to message length, multi-message bursts,
- * natural pauses, and long-running timers that survive setTimeout limits.
+ * natural pauses, occasional typo + "*correction" follow-ups, and
+ * long-running timers that survive setTimeout limits.
  */
 import { sendMessage, sendTyping } from './telegram.js';
 
@@ -34,10 +35,38 @@ async function typeFor(chatId, ms) {
   }
 }
 
+const TYPO_PROBABILITY = 0.07;
+
+/**
+ * Occasionally introduces a realistic fat-finger typo (adjacent letter swap
+ * in one word) and returns the "*word" correction to send right after —
+ * the classic human pattern. Returns { text, correction|null }.
+ */
+export function maybeTypo(text) {
+  if (text.length < 15 || Math.random() > TYPO_PROBABILITY) {
+    return { text, correction: null };
+  }
+  const words = text.split(' ');
+  // Pick a purely alphabetic word long enough that a swap is plausible.
+  const candidates = words
+    .map((w, i) => ({ w, i }))
+    .filter(({ w }) => w.length >= 5 && /^[\p{L}]+$/u.test(w));
+  if (!candidates.length) return { text, correction: null };
+
+  const { w, i } = candidates[Math.floor(Math.random() * candidates.length)];
+  const pos = 1 + Math.floor(Math.random() * (w.length - 2));
+  const typoed = w.slice(0, pos) + w[pos + 1] + w[pos] + w.slice(pos + 2);
+  if (typoed === w) return { text, correction: null };
+
+  words[i] = typoed;
+  return { text: words.join(' '), correction: `*${w}` };
+}
+
 /**
  * Sends `text` like a human: split into bursts on blank lines, each burst
  * preceded by a realistic typing period, with short pauses between bursts.
- * Returns the array of burst strings actually sent.
+ * Occasionally a burst goes out with a typo, followed by a quick "*fix".
+ * Returns the array of strings actually sent (in order).
  */
 export async function sendHumanLike(chatId, text) {
   const bursts = text
@@ -45,12 +74,30 @@ export async function sendHumanLike(chatId, text) {
     .map((b) => b.trim())
     .filter(Boolean);
 
+  const sent = [];
+  let typoUsed = false; // at most one typo per send — humans aren't that sloppy
   for (let i = 0; i < bursts.length; i++) {
     if (i > 0) await sleep(rand(800, 2500)); // breather between bursts
-    await typeFor(chatId, typingDuration(bursts[i]));
-    await sendMessage(chatId, bursts[i]);
+
+    let burst = bursts[i];
+    let correction = null;
+    if (!typoUsed) {
+      ({ text: burst, correction } = maybeTypo(burst));
+      if (correction) typoUsed = true;
+    }
+
+    await typeFor(chatId, typingDuration(burst));
+    await sendMessage(chatId, burst);
+    sent.push(burst);
+
+    if (correction) {
+      await sleep(rand(1500, 5000)); // notice the typo, fix it
+      await typeFor(chatId, typingDuration(correction));
+      await sendMessage(chatId, correction);
+      sent.push(correction);
+    }
   }
-  return bursts;
+  return sent;
 }
 
 /**

@@ -9,6 +9,13 @@ function required(name) {
   return v.trim();
 }
 
+function normalizeEndpoint(value) {
+  if (!value) return undefined;
+  const v = value.trim();
+  if (!v) return undefined;
+  return /^https?:\/\//.test(v) ? v : `https://${v}`;
+}
+
 export const config = {
   telegram: {
     token: required('TELEGRAM_BOT_TOKEN'),
@@ -20,17 +27,27 @@ export const config = {
   openrouter: {
     apiKey: required('OPENROUTER_API_KEY'),
     model: required('OPENROUTER_MODEL'),
+    // Vision/audio-capable model for photo descriptions & voice transcription.
+    // Falls back to the main model if unset.
+    mediaModel: process.env.OPENROUTER_MEDIA_MODEL?.trim() || required('OPENROUTER_MODEL'),
   },
   s3: {
-    endpoint: process.env.S3_ENDPOINT?.trim() || undefined,
+    endpoint: normalizeEndpoint(process.env.S3_ENDPOINT),
     region: required('S3_REGION'),
     bucket: required('S3_BUCKET'),
     accessKeyId: required('S3_ACCESS_KEY_ID'),
     secretAccessKey: required('S3_SECRET_ACCESS_KEY'),
     prefix: (process.env.S3_PREFIX?.trim() || '').replace(/^\/+|\/+$/g, ''),
   },
+  dashboard: {
+    // If unset, the dashboard is disabled entirely.
+    password: process.env.DASHBOARD_PASSWORD?.trim() || null,
+  },
   port: parseInt(process.env.PORT || '3000', 10),
   timezone: process.env.PERSON_TIMEZONE?.trim() || 'Europe/Zurich',
   // How many messages chat.jsonl keeps per conversation.
   chatHistoryLimit: 200,
+  // How often the followup guard runs (ensures every contact always has a
+  // pending followup scheduled).
+  followupGuardIntervalMs: 60 * 60 * 1000,
 };
