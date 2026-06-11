@@ -6,7 +6,7 @@
  *   chats/<userId>/memory.txt  — long-term facts distilled from conversations
  *   chats/<userId>/state.json  — pending reply / followup timers (survive restarts)
  */
-import { s3Get, s3Put } from './storage.js';
+import { s3Get, s3Put, s3Delete, s3List } from './storage.js';
 import { config } from './config.js';
 
 const cache = new Map(); // key -> parsed value
@@ -99,4 +99,39 @@ export async function setState(userId, patch) {
   cache.set(stateKey(userId), state);
   await s3Put(stateKey(userId), JSON.stringify(state, null, 2));
   return state;
+}
+
+// ── Contact discovery & pruning ──────────────────────────────────────────────
+
+/**
+ * Every contact that has any data on disk, discovered by listing S3. Needed
+ * because with "allow all" the persona talks to people not on any fixed list.
+ */
+export async function listContactIds() {
+  const keys = await s3List('chats/');
+  const ids = new Set();
+  for (const key of keys) {
+    const m = key.match(/^chats\/([^/]+)\//);
+    if (m) ids.add(m[1]);
+  }
+  return [...ids];
+}
+
+/**
+ * Wipes a contact's data so the conversation starts from scratch. Each artifact
+ * can be removed independently; by default all three go.
+ */
+export async function resetContact(userId, { chat = true, memory = true, state = true } = {}) {
+  if (chat) {
+    cache.delete(chatKey(userId));
+    await s3Delete(chatKey(userId));
+  }
+  if (memory) {
+    cache.delete(memoryKey(userId));
+    await s3Delete(memoryKey(userId));
+  }
+  if (state) {
+    cache.delete(stateKey(userId));
+    await s3Delete(stateKey(userId));
+  }
 }

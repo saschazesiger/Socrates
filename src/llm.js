@@ -7,6 +7,7 @@
  */
 import { readFile } from 'node:fs/promises';
 import { config } from './config.js';
+import { getSettings, behavior } from './settings.js';
 import { normalizeReaction } from './telegram.js';
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
@@ -18,6 +19,10 @@ export async function loadPerson() {
 }
 
 export async function chatCompletion(messages, { json = false, model, temperature = 0.9 } = {}) {
+  const chosenModel = model || getSettings().model || config.openrouter.model;
+  if (!chosenModel) {
+    throw new Error('No OpenRouter model configured — set one in the dashboard → Settings.');
+  }
   const res = await fetch(OPENROUTER_URL, {
     method: 'POST',
     headers: {
@@ -25,7 +30,7 @@ export async function chatCompletion(messages, { json = false, model, temperatur
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      model: model || config.openrouter.model,
+      model: chosenModel,
       messages,
       ...(json ? { response_format: { type: 'json_object' } } : {}),
       temperature,
@@ -117,7 +122,7 @@ export async function generateReply({ userId, memory, chat }) {
         content: `Recent chat history with this contact (Telegram user ${userId}):\n\n${formatChat(chat)}\n\nDecide how you respond. Output the JSON object only.`,
       },
     ],
-    { json: true }
+    { json: true, temperature: behavior().replyTemperature }
   );
   return sanitizeReply(parseJson(raw));
 }
@@ -127,19 +132,24 @@ const clampNum = (v, min, max, fallback) => {
   return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
 };
 
-// ±12% jitter so LLM-chosen delays never form a statistical fingerprint.
-const jitter = (seconds) => Math.round(seconds * (0.88 + Math.random() * 0.24));
+// ± jitter (settings.behavior.answerDelayJitter) so LLM-chosen delays never
+// form a statistical fingerprint.
+const jitter = (seconds) => {
+  const j = behavior().answerDelayJitter;
+  return Math.round(seconds * (1 - j + Math.random() * 2 * j));
+};
 
 function sanitizeReply(r) {
+  const b = behavior();
   return {
     answerNeeded: Boolean(r.answerNeeded),
     answer: typeof r.answer === 'string' ? r.answer.trim() : '',
-    answerDelay: jitter(clampNum(r.answerDelay, 2, 60 * 60 * 14, 60)), // 2s … 14h
+    answerDelay: jitter(clampNum(r.answerDelay, b.minAnswerDelaySeconds, b.maxAnswerDelaySeconds, 60)),
     reaction: normalizeReaction(r.reaction),
     followup:
       typeof r.followup === 'string' && r.followup.trim()
         ? r.followup.trim()
-        : 'hey, alles klar bei dir?',
+        : 'hey, you around?',
     followupDelay: jitter(clampNum(r.followupDelay, 60 * 5, 60 * 60 * 24 * 14, 60 * 60 * 24)), // 5min … 14d
     memoryUpdateNeeded: Boolean(r.memoryUpdateNeeded),
   };
@@ -169,16 +179,40 @@ export async function generateFollowup({ userId, memory, chat }) {
         content: `Recent chat history with this contact (Telegram user ${userId}):\n\n${formatChat(chat)}\n\nPlan your next message. Output the JSON object only.`,
       },
     ],
-    { json: true }
+    { json: true, temperature: behavior().replyTemperature }
   );
   const r = parseJson(raw);
   return {
     followup:
       typeof r.followup === 'string' && r.followup.trim()
         ? r.followup.trim()
-        : 'hey, was lauft bi dir so?',
+        : 'hey, what are you up to?',
     followupDelay: jitter(clampNum(r.followupDelay, 60 * 30, 60 * 60 * 24 * 14, 60 * 60 * 24)), // 30min … 14d
   };
+}
+
+/**
+ * Fetches the OpenRouter model catalogue (id + name) for the dashboard's model
+ * picker. Best-effort; returns [] on any failure.
+ */
+let modelsCache = null;
+export async function listModels() {
+  if (modelsCache && Date.now() - modelsCache.at < 10 * 60 * 1000) return modelsCache.list;
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/models', {
+      headers: { Authorization: `Bearer ${config.openrouter.apiKey}` },
+    });
+    if (!res.ok) throw new Error(`OpenRouter ${res.status}`);
+    const data = await res.json();
+    const list = (data.data ?? [])
+      .map((m) => ({ id: m.id, name: m.name || m.id }))
+      .sort((a, b) => a.id.localeCompare(b.id));
+    modelsCache = { at: Date.now(), list };
+    return list;
+  } catch (err) {
+    console.error('[llm] listModels failed:', err.message);
+    return modelsCache?.list ?? [];
+  }
 }
 
 const MEMORY_SYSTEM = `You maintain the long-term memory file of the person described below, regarding one specific Telegram contact. The chat history only keeps the last ${config.chatHistoryLimit} messages, so anything important must live in this memory file or it is lost forever.

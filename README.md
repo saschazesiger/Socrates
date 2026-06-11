@@ -10,9 +10,12 @@ A Node.js app that imitates a real person over Telegram. It drives a **real Tele
 - **Always a followup planned** — if the contact goes quiet, the persona naturally re-engages later ("how did the interview go?"). There is *always* exactly one upcoming followup scheduled per contact; it's discarded the moment they reply.
 - **Photos & voice notes** — incoming photos are described and voice messages transcribed via a vision/audio-capable model, so the persona reacts to their content.
 - **Long-term memory** — chat history keeps the last 200 messages per contact (`chat.jsonl`); important facts are distilled into a per-contact `memory.txt` so nothing is lost.
-- **Admin dashboard** — password-protected web UI to inspect conversations, edit memory, cancel/regenerate pending messages, and send manual messages as the persona.
+- **Admin dashboard** — password-protected web UI that is now the control center for the whole bot:
+  - **Contacts** — inspect conversations, edit memory, cancel/**edit**/**send-now**/regenerate pending reply & followup, send manual messages as the persona, and **prune** a contact's chat / memory / timers to start that conversation from scratch.
+  - **Settings** — manage the **allowed accounts** (or flip on **allow-everyone**), pick the **main and media models** (from the live OpenRouter catalogue), tune the **humanisation knobs** (typing speed, typo rate, burst gaps, online linger, delay jitter/clamps), and flip a global **pause** kill-switch — all without a redeploy.
+  - **Connection** — see live userbot status and **log the persona's account in from the browser** (phone → code → 2FA), minting and persisting the Telegram session with no env var or local `npm run login`.
 
-Everything persists to S3-compatible storage, so the app itself is stateless and survives restarts/redeploys — including "reply tomorrow at 7am" timers.
+Everything persists to S3-compatible storage, so the app itself is stateless and survives restarts/redeploys — including "reply tomorrow at 7am" timers. Runtime configuration (the Telegram session, allowed accounts, model choice, and behaviour knobs) lives in a single `settings.json` in the same bucket and is edited entirely from the dashboard — so a fresh deploy can be authorised and tuned without touching environment variables.
 
 > ⚠️ This runs an **automated real account**. Telegram's terms restrict abusive automation (spam, mass-messaging, etc.); a normal, low-volume personal conversation is what this is built for. Use an account you control and only with people you're allowed to talk to. See [responsible use](#a-note-on-responsible-use).
 
@@ -55,35 +58,46 @@ Copy the session string. Treat it like a password: it is full access to the acco
 
    | Variable | Value |
    |---|---|
-   | `TELEGRAM_API_ID` | from my.telegram.org |
-   | `TELEGRAM_API_HASH` | from my.telegram.org |
-   | `TELEGRAM_SESSION` | the string printed by `npm run login` |
-   | `ALLOWED_USER_IDS` | comma-separated Telegram user IDs the persona talks to |
-   | `OPENROUTER_API_KEY` | your OpenRouter key |
-   | `OPENROUTER_MODEL` | e.g. `deepseek/deepseek-v4-flash` |
-   | `OPENROUTER_MEDIA_MODEL` | e.g. `google/gemini-2.5-flash` (vision + audio) |
+   | `TELEGRAM_API_ID` | from my.telegram.org (**required**) |
+   | `TELEGRAM_API_HASH` | from my.telegram.org (**required**) |
+   | `OPENROUTER_API_KEY` | your OpenRouter key (**required**) |
    | `S3_ENDPOINT` | e.g. `hel1.your-objectstorage.com` (omit for plain AWS) |
-   | `S3_REGION` / `S3_BUCKET` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | your bucket |
+   | `S3_REGION` / `S3_BUCKET` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | your bucket (**required**) |
    | `S3_PREFIX` | optional, e.g. `socrates` |
-   | `DASHBOARD_PASSWORD` | a strong password for the web dashboard |
+   | `DASHBOARD_PASSWORD` | a strong password for the web dashboard (**required** — it now also gates Telegram login and all settings) |
    | `PERSON_TIMEZONE` | e.g. `Asia/Hong_Kong` |
+   | `TELEGRAM_SESSION` | **optional** — managed in the dashboard now. If set, only seeds `settings.json` on first boot. |
+   | `ALLOWED_USER_IDS` | **optional** — managed in the dashboard now. Comma-separated; only seeds the initial allow-list. |
+   | `OPENROUTER_MODEL` | **optional** — managed in the dashboard now. e.g. `deepseek/deepseek-v4-flash`; only seeds the initial model. |
+   | `OPENROUTER_MEDIA_MODEL` | **optional** — managed in the dashboard now. e.g. `google/gemini-2.5-flash` (vision + audio). |
 
    Do **not** set `PORT` — Railway injects it automatically and the app reads it.
 
+   > The four "optional / managed in the dashboard" variables used to be required. They've moved into `settings.json` so you can change them live. You can deploy with **only** the required ones above, then open the dashboard → **Connection** to log the account in and → **Settings** to pick a model and add allowed contacts. Setting them as env vars still works — they simply seed `settings.json` the first time the app boots.
+
 4. **Settings → Networking → Generate Domain** to get a public URL. That URL serves the dashboard at `/` (login with `DASHBOARD_PASSWORD`), plus `GET /health` and `GET /status`.
 
-5. Recommended Railway settings:
+5. **Authorise the account from the dashboard.** Open the URL → log in with `DASHBOARD_PASSWORD` → **Connection** → enter the persona's phone number → enter the code Telegram sends → enter the 2FA password if the account has one. The session is minted and saved to `settings.json`, and the userbot connects immediately. (You can still do the one-time local `npm run login` instead and paste the string into `TELEGRAM_SESSION` if you prefer.)
+
+6. Recommended Railway settings:
    - **Settings → Deploy → Healthcheck Path**: `/health`
    - **Replicas: exactly 1.** The userbot holds one MTProto connection and in-process timers — a second replica would log in the same account twice and double-send messages.
    - **Restart policy**: On Failure. Pending replies/followups are persisted to S3 and restored on boot, so restarts are safe.
    - Use a plan/settings where the service **never sleeps** — a sleeping service can't send the "7 hours later" reply, manage online status, or run typing indicators. (App sleeping is the killer for this use case; the always-on Hobby/Pro plans are fine.)
 
-6. Deploy. Logs should show:
+7. Deploy. Once a session exists (env var or dashboard login), logs should show:
 
    ```
    [http] listening on :XXXX
    [telegram] userbot connected as Kin (id 123456789)
    [telegram] listening for incoming messages
+   ```
+
+   Before you've logged in, the server still boots and stays up so you can authorise from the dashboard — you'll see instead:
+
+   ```
+   [http] listening on :XXXX
+   [telegram] no authorised session — open the dashboard → Connection to log in (phone + code)
    ```
 
    Send a message to the persona's account from an allowed contact and watch the decision log:
@@ -93,7 +107,7 @@ Copy the session string. Treat it like a password: it is full access to the acco
    [bot] decision for 11111111: answerNeeded=true reaction=- delay=312s followupDelay=14400s memory=true
    ```
 
-> If logs show *"Telegram session is not authorized"*, the `TELEGRAM_SESSION` is missing/expired or was created with different `api_id`/`api_hash` — re-run `npm run login` with the same API credentials you deploy with.
+> If the userbot won't connect, the session is missing/expired or was created with different `api_id`/`api_hash`. Re-authorise from the dashboard → **Connection** (or re-run `npm run login`) using the same API credentials you deploy with.
 
 ### Updating the persona
 
@@ -102,21 +116,21 @@ Copy the session string. Treat it like a password: it is full access to the acco
 ## Local development
 
 ```bash
-cp .env.example .env   # fill in real values (incl. TELEGRAM_SESSION from `npm run login`)
+cp .env.example .env   # only the required vars are needed (see .env.example)
 npm install
 npm run dev            # auto-restarts on file changes
 ```
 
-Dashboard at `http://localhost:3000/`. Running locally logs in the **same account** as production — don't run both at once against one session.
+Then open `http://localhost:3000/`, log in, and authorise the account from **Connection** (or paste a `TELEGRAM_SESSION` from `npm run login` into `.env`). Running locally logs in the **same account** as production — don't run both at once against one session.
 
 ## Endpoints
 
 | Path | Auth | Purpose |
 |---|---|---|
-| `/` | dashboard password | Admin dashboard (chat view, memory editor, pending actions, manual send) |
+| `/` | dashboard password | Admin dashboard — Contacts (chat, memory, pending edit/send-now, manual send, prune), Settings (accounts, models, behaviour, pause), Connection (login + status) |
 | `/api/*` | bearer token from login | Dashboard JSON API |
 | `/health` | none | Liveness probe |
-| `/status` | none | Per-contact summary (log size, pending reply/followup due times) |
+| `/status` | none | Model, pause state, connection status, and per-contact summary (log size, pending due times) |
 
 ## A note on responsible use
 

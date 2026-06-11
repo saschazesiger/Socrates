@@ -26,8 +26,11 @@ src/humanize.js ── at answerDelay: come ONLINE, mark READ, react,
       │   after firing, the NEXT followup is generated immediately)
       └── if memoryUpdateNeeded: second LLM call distills chat → memory.txt
 
-src/dashboard.js ── password-protected admin UI/API on "/" (Express)
-scripts/login.mjs ── one-time interactive login → prints TELEGRAM_SESSION
+src/dashboard.js ── password-protected admin UI/API on "/" (Express):
+      │            Contacts · Settings · Connection (Telegram login from browser)
+src/settings.js ── runtime config in S3 (settings.json): session, allowed
+      │            accounts/allow-all, model + media model, behaviour knobs, pause
+scripts/login.mjs ── optional one-time interactive login → prints TELEGRAM_SESSION
 ```
 
 ### File map
@@ -35,42 +38,79 @@ scripts/login.mjs ── one-time interactive login → prints TELEGRAM_SESSION
 | File | Purpose |
 |---|---|
 | `src/index.js` | Entrypoint. Express server (`/health`, `/status`, dashboard), connects the userbot, restores persisted timers, runs the hourly followup guard. |
-| `src/config.js` | Loads and validates all env variables. Fails fast on missing ones. Normalizes the S3 endpoint (adds `https://` if missing). |
-| `src/telegram.js` | gramjs **MTProto userbot** client: connect/auth via StringSession, incoming-message normalization, `sendMessage`, typing action, emoji reactions (+ normalization), **presence (`setOnline`)**, **read receipts (`markRead`)**, media download. Peers handled as serializable `{ id, accessHash }` descriptors. |
+| `src/config.js` | Loads and validates env variables. Fails fast on missing **required** ones (API id/hash, OpenRouter key, S3, dashboard password). The session / allow-list / model vars are now optional and only **seed** `settings.json`. Normalizes the S3 endpoint. |
+| `src/settings.js` | Runtime configuration stored in S3 as `settings.json` (write-through cache), editable live from the dashboard: `session`, `allowedUserIds`, `allowAll`, `model`, `mediaModel`, and a `behavior` block (typing speed, typo rate, burst gaps, online linger, delay jitter/clamps, reply temperature, global `paused`). Seeded from env on first boot. Exposes `getSettings`/`updateSettings`/`isAllowed`/`redactedSettings`. |
+| `src/telegram.js` | gramjs **MTProto userbot** client: connect/auth via StringSession (read from `settings.json`), incoming-message normalization, `sendMessage`, typing action, emoji reactions (+ normalization), **presence (`setOnline`)**, **read receipts (`markRead`)**, media download. Also: the **browser login flow** (`loginStart`/`loginCode`/`loginPassword` → phone, code, 2FA), live `restart()` after a session change, `connectionStatus()`, and best-effort contact-name resolution for the dashboard. Peers handled as serializable `{ id, accessHash }` descriptors. |
 | `scripts/login.mjs` | One-time interactive login (`npm run login`): phone + code + 2FA → prints the `TELEGRAM_SESSION` StringSession. Standalone; needs only `TELEGRAM_API_ID`/`TELEGRAM_API_HASH`. |
-| `src/media.js` | Incoming photos → 1-2 sentence description; voice notes → verbatim transcript (downloaded via gramjs `downloadMedia`). Uses `OPENROUTER_MEDIA_MODEL`. Graceful placeholders on failure. |
-| `src/bot.js` | Conversation engine: allow-list check, debounce, reply/reaction/followup scheduling, followup invariant + guard, restart recovery, memory trigger, dashboard operations. |
-| `src/llm.js` | OpenRouter wrapper. `generateReply` (the JSON contract), `generateFollowup` (re-engagement planning), `updateMemory` (distillation), raw `chatCompletion`. |
-| `src/humanize.js` | Human realism: typing duration ∝ message length, burst splitting, inter-burst pauses, typo + `*correction` (≤1 per send, ~7% chance), long-delay timers. |
-| `src/store.js` | Data layer over S3: `chat.jsonl` (append+trim in ONE function), `memory.txt`, `state.json` — all **per contact**. |
-| `src/storage.js` | Raw S3 get/put (AWS SDK v3, works with AWS, MinIO, Cloudflare R2, Hetzner via `S3_ENDPOINT`). |
-| `src/dashboard.js` | Admin dashboard: login (DASHBOARD_PASSWORD → bearer token), chat viewer, memory editor, pending-action cancel/regenerate, manual send. Single-file HTML UI, no build step. |
+| `src/media.js` | Incoming photos → 1-2 sentence description; voice notes → verbatim transcript (downloaded via gramjs `downloadMedia`). Uses the media model from `settings.json` (falls back to the main model). Graceful placeholders on failure. |
+| `src/bot.js` | Conversation engine: allow-list check (settings-driven), debounce, reply/reaction/followup scheduling, followup invariant + guard, restart recovery, memory trigger, global pause, dynamic contact discovery, and the dashboard operations (edit/send-now/cancel/regenerate/prune). |
+| `src/llm.js` | OpenRouter wrapper. `generateReply` (the JSON contract), `generateFollowup` (re-engagement planning), `updateMemory` (distillation), raw `chatCompletion`, and `listModels` (catalogue for the dashboard picker). Model + temperature + delay clamps come from `settings.json`. |
+| `src/humanize.js` | Human realism: typing duration ∝ message length, burst splitting, inter-burst pauses, typo + `*correction`, long-delay timers — all tunable live via `settings.json` behaviour knobs. |
+| `src/store.js` | Data layer over S3: `chat.jsonl` (append+trim in ONE function), `memory.txt`, `state.json` — all **per contact** — plus contact discovery (`listContactIds`) and pruning (`resetContact`). |
+| `src/storage.js` | Raw S3 get/put/**delete/list** (AWS SDK v3, works with AWS, MinIO, Cloudflare R2, Hetzner via `S3_ENDPOINT`). |
+| `src/dashboard.js` | Admin dashboard (single-file HTML UI, no build step): login (DASHBOARD_PASSWORD → bearer token). **Contacts** (chat viewer, memory editor, pending reply/followup cancel·edit·send-now·regenerate, manual send, prune chat/memory/state). **Settings** (allowed accounts / allow-all, model + media-model picker from OpenRouter's catalogue, behaviour knobs, global pause). **Connection** (userbot status + phone→code→2FA login that persists the session and restarts the client). |
 | `person.md` | THE persona. Sent verbatim to the LLM with every request. |
 
 ## Environment variables
 
-See `.env.example`. All are required unless noted.
+See `.env.example`. Required unless marked optional. Four formerly-required vars
+(`TELEGRAM_SESSION`, `ALLOWED_USER_IDS`, `OPENROUTER_MODEL`, `OPENROUTER_MEDIA_MODEL`)
+are now **runtime settings** held in `settings.json` and edited from the dashboard;
+if set in the env they only **seed** `settings.json` on first boot.
 
 | Variable | Meaning |
 |---|---|
-| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | MTProto app credentials from https://my.telegram.org → API development tools. Identify the *app*, not the account. |
-| `TELEGRAM_SESSION` | gramjs StringSession for the persona's account, minted once by `npm run login`. Full account access — treat as a secret. Empty is allowed only so the login script can run. |
-| `ALLOWED_USER_IDS` | Comma-separated Telegram user IDs the persona talks to. **Everyone else is silently ignored.** |
-| `OPENROUTER_API_KEY` | OpenRouter API key. |
-| `OPENROUTER_MODEL` | Main model slug. Pick one that follows persona instructions well and supports JSON output. |
-| `OPENROUTER_MEDIA_MODEL` | Optional. Vision **and** audio capable model for photo description / voice transcription (recommended: `google/gemini-2.5-flash`). Defaults to `OPENROUTER_MODEL`. |
+| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | **Required.** MTProto app credentials from https://my.telegram.org → API development tools. Identify the *app*, not the account. |
+| `OPENROUTER_API_KEY` | **Required.** OpenRouter API key. |
+| `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | **Required.** S3 credentials and location. |
 | `S3_ENDPOINT` | Optional. Custom S3 endpoint (MinIO/R2/Hetzner). With or without `https://`. Omit for plain AWS. |
-| `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | S3 credentials and location. |
 | `S3_PREFIX` | Optional key prefix inside the bucket. |
-| `DASHBOARD_PASSWORD` | Password for the admin dashboard at `/`. If unset, the dashboard is **disabled**. |
+| `DASHBOARD_PASSWORD` | **Required in practice.** Password for the dashboard at `/`. If unset, the dashboard is **disabled** — and with it the only way to log in / change settings without env vars. |
 | `PORT` | HTTP port (default 3000; injected by Railway). |
 | `PERSON_TIMEZONE` | IANA timezone of the imitated person (default `Europe/Zurich`). Drives all "what time is it for me" reasoning. |
+| `TELEGRAM_SESSION` | **Optional / seed.** gramjs StringSession (full account access — secret). Normally minted from the dashboard → Connection; `npm run login` still works. Stored in `settings.json` thereafter. |
+| `ALLOWED_USER_IDS` | **Optional / seed.** Comma-separated Telegram user IDs. The live allow-list (and an "allow everyone" toggle) is edited in the dashboard → Settings. |
+| `OPENROUTER_MODEL` | **Optional / seed.** Main model slug (must follow persona instructions + support JSON output). Selected in the dashboard → Settings. |
+| `OPENROUTER_MEDIA_MODEL` | **Optional / seed.** Vision **and** audio capable model for photos/voice (e.g. `google/gemini-2.5-flash`). Falls back to the main model. |
+
+## Runtime settings (`settings.json`)
+
+Everything an operator changes without a redeploy lives in one S3 object,
+`<S3_PREFIX>/settings.json`, owned by `src/settings.js` (write-through cache).
+On first boot it is **seeded from the env vars** above; after that the dashboard
+is the source of truth and the env values are ignored.
+
+```jsonc
+{
+  "session": "<TELEGRAM StringSession>",   // minted via dashboard login (secret)
+  "allowedUserIds": ["11111111"],          // who the persona talks to …
+  "allowAll": false,                        // … unless this is true (reply to anyone)
+  "model": "deepseek/deepseek-v4-flash",   // main model (replies, memory)
+  "mediaModel": "google/gemini-2.5-flash", // vision+audio (falls back to model)
+  "behavior": {
+    "paused": false,                        // global kill-switch (auto sends held)
+    "typoProbability": 0.07,
+    "typingCharsPerSecMin": 4, "typingCharsPerSecMax": 7, "typingMaxSeconds": 45,
+    "burstGapMinMs": 800, "burstGapMaxMs": 2500,
+    "onlineLingerMinMs": 5000, "onlineLingerMaxMs": 30000,
+    "answerDelayJitter": 0.12,
+    "minAnswerDelaySeconds": 2, "maxAnswerDelaySeconds": 50400,
+    "replyTemperature": 0.9
+  }
+}
+```
+
+- **session** — read by `telegram.js` `getClient()`. Changing it (dashboard login or logout) calls `restart()`, which tears down the MTProto connection and reconnects with the new session, re-using the same message handler. The userbot start is **non-fatal** when no session is authorised yet, so the HTTP server + dashboard stay up for the login flow.
+- **allowedUserIds / allowAll** — checked by `isAllowed()` on every incoming message. With `allowAll`, contacts the persona has never been configured for are discovered dynamically by listing S3 (`store.listContactIds`), so they still appear in the dashboard and get followups/restored timers.
+- **model / mediaModel** — resolved in `llm.chatCompletion` and `media.js`. The dashboard model picker is populated from OpenRouter's live `/models` catalogue (`llm.listModels`), with a free-text fallback for any slug.
+- **behavior** — read live by `humanize.js` (typing/typo/bursts), `bot.js` (online linger, pause), and `llm.js` (delay jitter/clamps, reply temperature). `paused` holds scheduled replies/followups (re-checked every 30s) without dropping them; manual dashboard sends still go out.
 
 ## Persistent data (S3 layout)
 
 Conversations are kept **strictly per contact** — the imitated person talks to several people, and each relationship has its own history, memory and timers. Nothing is shared between contacts:
 
 ```
+<S3_PREFIX>/settings.json               # runtime config (session, accounts, models, behaviour)
 <S3_PREFIX>/chats/<userId>/chat.jsonl   # last 200 messages of this conversation
 <S3_PREFIX>/chats/<userId>/memory.txt   # long-term distilled facts about this contact
 <S3_PREFIX>/chats/<userId>/state.json   # pending reply/followup timers (restart survival)
@@ -131,20 +171,34 @@ Contacts with zero chat history are never cold-opened by the guard.
 
 `src/media.js` converts incoming media to text before anything else touches it:
 
-- **Photos** — downloaded via gramjs `downloadMedia`, sent base64 to `OPENROUTER_MEDIA_MODEL` as `image_url`, described in 1-2 sentences (including visible text). Captions (which live in `message.message` for MTProto media) are preserved. Stored as `[sent a photo (caption: "…"): description]`.
+- **Photos** — downloaded via gramjs `downloadMedia`, sent base64 to the configured media model (`settings.mediaModel`) as `image_url`, described in 1-2 sentences (including visible text). Captions (which live in `message.message` for MTProto media) are preserved. Stored as `[sent a photo (caption: "…"): description]`.
 - **Voice notes** — downloaded via `downloadMedia` and sent as `input_audio` (ogg/opus as Telegram delivers it) for verbatim transcription. Stored as `[sent a voice message, 12s: "transcript"]`. Gemini models handle ogg audio; if the media model can't, the graceful fallback is stored instead — `[… could not be listened to right now]` — and the persona deflects like a human who couldn't listen ("i listen later la, on the train now").
 
 The reply prompt tells the model these bracketed lines describe media, so the persona reacts to the *content* naturally.
 
 ## Dashboard
 
-Enabled when `DASHBOARD_PASSWORD` is set; served at `/`. Login exchanges the password for an in-memory bearer token (restart = re-login). Features per contact:
+Enabled when `DASHBOARD_PASSWORD` is set; served at `/`. Login exchanges the password for an in-memory bearer token (restart = re-login). Three sections, switched from the left nav; the header always shows connection status, the live/paused state (one-click toggle), and the active model.
 
-- **Chat** — full chat.jsonl rendered as bubbles; manual send box (message goes out human-like with typing and bursts, and is logged as `me`).
-- **Pending** — inspect the queued reply (text/reaction + due time) and followup; cancel either; regenerate the followup on demand.
-- **Memory** — view and edit memory.txt directly, or trigger a fresh distillation from the chat.
+**Contacts** — per-contact tabs:
+- **Chat** — full chat.jsonl rendered as bubbles (reactions shown distinctly); manual send box (goes out human-like with typing and bursts, logged as `me`).
+- **Pending** — inspect the queued reply (editable text + reaction) and followup (editable text); **Save** (re-arms the timer at the same due time), **Send now** (fires immediately, ignoring pause), **Cancel**, and **Regenerate** the followup.
+- **Memory** — view/edit memory.txt directly, or trigger a fresh distillation from the chat.
+- **Reset** — prune this contact's **chat history**, **memory**, or do a **full wipe** (chat + memory + timers) to start the conversation from scratch.
 
-JSON API under `/api/*` (same token): `POST /api/login`, `GET /api/contacts`, `GET/PUT /api/contacts/:id/memory`, `GET /api/contacts/:id/chat`, `POST /api/contacts/:id/send|cancel|regenerate-followup|update-memory`.
+**Settings** — writes `settings.json`:
+- **Allowed contacts** — add/remove user IDs, or flip **allow everyone**.
+- **Models** — pick the main and media models from the OpenRouter catalogue, or type any slug.
+- **Behaviour** — every humanisation knob (typo rate, typing speed, burst gaps, online linger, delay jitter/clamps, reply temperature) plus the global **pause** kill-switch.
+
+**Connection** — live userbot status (authorised / as whom) and the full login flow: phone number → the code Telegram sends → the 2FA password if the account has one. On success the session is saved to `settings.json` and the client reconnects. Also: **Restart connection** and **Log out** (clears the session).
+
+JSON API under `/api/*` (same bearer token):
+- Overview/config: `GET /api/stats`, `GET/PUT /api/settings`, `GET /api/models`.
+- Connection: `GET /api/connection`, `POST /api/connection/login/start|code|password`, `POST /api/connection/restart|logout`.
+- Contacts: `GET /api/contacts`, `GET /api/contacts/:id/chat`, `GET/PUT /api/contacts/:id/memory`, `POST /api/contacts/:id/send|cancel|regenerate-followup|update-memory|reset`, `POST /api/contacts/:id/reply/edit|send-now`, `POST /api/contacts/:id/followup/edit|send-now`.
+
+A login flow uses a **separate throwaway gramjs client** per attempt so it never disturbs the running userbot connection; on success its `StringSession` is what gets persisted.
 
 ## Telegram realism — what the userbot makes possible
 

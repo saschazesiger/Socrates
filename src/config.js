@@ -9,11 +9,22 @@ function required(name) {
   return v.trim();
 }
 
+function optional(name) {
+  return process.env[name]?.trim() || '';
+}
+
 function normalizeEndpoint(value) {
   if (!value) return undefined;
   const v = value.trim();
   if (!v) return undefined;
   return /^https?:\/\//.test(v) ? v : `https://${v}`;
+}
+
+function parseList(value) {
+  return (value || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 export const config = {
@@ -22,20 +33,20 @@ export const config = {
     // api_id / api_hash from https://my.telegram.org → API development tools.
     apiId: parseInt(required('TELEGRAM_API_ID'), 10),
     apiHash: required('TELEGRAM_API_HASH'),
-    // StringSession produced once by `npm run login`. Optional only so the
-    // login script itself can run without it.
-    session: process.env.TELEGRAM_SESSION?.trim() || '',
-    allowedUserIds: required('ALLOWED_USER_IDS')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean),
+    // StringSession is no longer required here — it is managed at runtime in
+    // settings.json (mint it from the dashboard, or `npm run login`). Any value
+    // set in the env is used only to SEED settings.json on first boot.
+    session: optional('TELEGRAM_SESSION'),
+    // Allowed contacts and "allow all" now live in settings.json (editable in
+    // the dashboard). The env value, if present, only seeds the initial list.
+    allowedUserIds: parseList(process.env.ALLOWED_USER_IDS),
   },
   openrouter: {
     apiKey: required('OPENROUTER_API_KEY'),
-    model: required('OPENROUTER_MODEL'),
-    // Vision/audio-capable model for photo descriptions & voice transcription.
-    // Falls back to the main model if unset.
-    mediaModel: process.env.OPENROUTER_MEDIA_MODEL?.trim() || required('OPENROUTER_MODEL'),
+    // Model + media model now live in settings.json (editable in the dashboard).
+    // The env values, if present, only seed the initial settings.
+    model: optional('OPENROUTER_MODEL'),
+    mediaModel: optional('OPENROUTER_MEDIA_MODEL'),
   },
   s3: {
     endpoint: normalizeEndpoint(process.env.S3_ENDPOINT),

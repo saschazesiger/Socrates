@@ -2,6 +2,8 @@ import {
   S3Client,
   GetObjectCommand,
   PutObjectCommand,
+  DeleteObjectCommand,
+  ListObjectsV2Command,
 } from '@aws-sdk/client-s3';
 import { config } from './config.js';
 
@@ -45,4 +47,40 @@ export async function s3Put(key, body) {
         : 'text/plain; charset=utf-8',
     })
   );
+}
+
+/** Deletes an object. A missing key is treated as success (idempotent). */
+export async function s3Delete(key) {
+  try {
+    await s3.send(
+      new DeleteObjectCommand({ Bucket: config.s3.bucket, Key: fullKey(key) })
+    );
+  } catch (err) {
+    if (err?.name === 'NoSuchKey' || err?.$metadata?.httpStatusCode === 404) return;
+    throw err;
+  }
+}
+
+/**
+ * Lists object keys under `prefix` (relative to S3_PREFIX), with the configured
+ * prefix stripped back off so callers see the same keys they pass to get/put.
+ */
+export async function s3List(prefix = '') {
+  const base = config.s3.prefix ? `${config.s3.prefix}/` : '';
+  const keys = [];
+  let ContinuationToken;
+  do {
+    const res = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: config.s3.bucket,
+        Prefix: fullKey(prefix),
+        ContinuationToken,
+      })
+    );
+    for (const obj of res.Contents ?? []) {
+      keys.push(base && obj.Key.startsWith(base) ? obj.Key.slice(base.length) : obj.Key);
+    }
+    ContinuationToken = res.IsTruncated ? res.NextContinuationToken : undefined;
+  } while (ContinuationToken);
+  return keys;
 }

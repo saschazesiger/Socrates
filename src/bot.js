@@ -2,7 +2,7 @@
  * The conversation engine.
  *
  * Flow per incoming message:
- *   1. Ignore senders not in ALLOWED_USER_IDS.
+ *   1. Ignore senders not allowed (settings.allowedUserIds / allowAll).
  *   2. Resolve media (photo description / voice transcript) to text.
  *   3. Append to chat.jsonl (append + trim in one function).
  *   4. Cancel any pending reply/followup — a new message changes the situation,
@@ -20,15 +20,20 @@
  *
  * Pending timers are persisted to state.json in S3, so a "reply in 7 hours"
  * or a "check in next week" followup survives restarts and redeploys.
+ *
+ * Global pause: when settings.behavior.paused is true, scheduled replies and
+ * followups are held (re-checked every 30s) rather than sent. Incoming messages
+ * are still read & logged, and manual dashboard sends still go out.
  */
-import { config } from './config.js';
-import { appendChat, getChat, getMemory, setMemory, getState, setState } from './store.js';
+import { appendChat, getChat, getMemory, setMemory, getState, setState, listContactIds, resetContact } from './store.js';
 import { generateReply, generateFollowup, updateMemory } from './llm.js';
 import { sendHumanLike, longTimeout } from './humanize.js';
-import { setReaction, setOnline, markRead } from './telegram.js';
+import { setReaction, setOnline, markRead, normalizeReaction, getContactName } from './telegram.js';
 import { messageToText } from './media.js';
+import { isAllowed, configuredUserIds, behavior } from './settings.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const PAUSE_RECHECK_MS = 30 * 1000;
 
 // userId -> { replyTimer, followupTimer, offlineTimer, generation }
 const live = new Map();
@@ -38,6 +43,13 @@ function liveState(userId) {
     live.set(userId, { replyTimer: null, followupTimer: null, offlineTimer: null, generation: 0 });
   }
   return live.get(userId);
+}
+
+/** Union of explicitly-allowed contacts and any that already have data on disk. */
+export async function knownContactIds() {
+  const ids = new Set(configuredUserIds());
+  for (const id of await listContactIds()) ids.add(id);
+  return [...ids];
 }
 
 // ── Presence: the persona comes online only while actively interacting ──────
@@ -54,11 +66,12 @@ function goOnline(userId) {
 /** Linger online a short human while after the last action, then drop offline. */
 function scheduleOffline(userId) {
   const ls = liveState(userId);
+  const b = behavior();
   if (ls.offlineTimer) clearTimeout(ls.offlineTimer);
   ls.offlineTimer = setTimeout(() => {
     ls.offlineTimer = null;
     setOnline(false);
-  }, 5000 + Math.random() * 25000);
+  }, b.onlineLingerMinMs + Math.random() * (b.onlineLingerMaxMs - b.onlineLingerMinMs));
 }
 
 function cancelTimers(userId) {
@@ -73,7 +86,7 @@ function cancelTimers(userId) {
 
 export async function handleIncoming(msg) {
   const userId = String(msg.from.id);
-  if (!config.telegram.allowedUserIds.includes(userId)) {
+  if (!isAllowed(userId)) {
     console.log(`[bot] ignoring message from non-allowed user ${userId}`);
     return;
   }
@@ -136,14 +149,24 @@ export async function handleIncoming(msg) {
 
 async function scheduleReply(userId, chatId, pending, generation) {
   await setState(userId, { pendingReply: pending });
-  liveState(userId).replyTimer = longTimeout(async () => {
+  armReplyTimer(userId, chatId, pending, generation);
+}
+
+/** Arms (or re-arms) the reply timer; while paused it re-checks every 30s. */
+function armReplyTimer(userId, chatId, pending, generation) {
+  const fn = async () => {
     if (liveState(userId).generation !== generation) return;
+    if (behavior().paused) {
+      liveState(userId).replyTimer = longTimeout(fn, PAUSE_RECHECK_MS);
+      return;
+    }
     try {
       await fireReply(userId, chatId, pending, generation);
     } catch (err) {
       console.error(`[bot] failed to send reply to ${userId}:`, err.message);
     }
-  }, pending.dueAt - Date.now());
+  };
+  liveState(userId).replyTimer = longTimeout(fn, pending.dueAt - Date.now());
 }
 
 async function fireReply(userId, chatId, pending, generation) {
@@ -185,26 +208,41 @@ async function fireReply(userId, chatId, pending, generation) {
 async function scheduleFollowup(userId, chatId, text, delayMs, generation) {
   const dueAt = Date.now() + delayMs;
   await setState(userId, { pendingFollowup: { text, dueAt, chatId } });
+  armFollowupTimer(userId, chatId, text, dueAt, generation);
+}
 
-  liveState(userId).followupTimer = longTimeout(async () => {
+/** Arms (or re-arms) the followup timer; while paused it re-checks every 30s. */
+function armFollowupTimer(userId, chatId, text, dueAt, generation) {
+  const fn = async () => {
     if (liveState(userId).generation !== generation) return;
+    if (behavior().paused) {
+      liveState(userId).followupTimer = longTimeout(fn, PAUSE_RECHECK_MS);
+      return;
+    }
     try {
-      await goOnline(userId); // online while typing the followup
-      const sent = await sendHumanLike(chatId, text);
-      for (const burst of sent) {
-        await appendChat(userId, { from: 'me', text: burst, chatId });
-      }
-      scheduleOffline(userId);
-      console.log(`[bot] -> ${userId} (followup): ${text.slice(0, 80)}`);
-      await setState(userId, { pendingFollowup: null });
-      // Followup invariant: immediately plan the NEXT one (scheduled, not sent).
-      // The LLM sees the growing run of unanswered messages and naturally
-      // spaces them out further / changes topic — no clinginess.
-      await chainNextFollowup(userId, chatId, generation);
+      await deliverFollowup(userId, chatId, text, generation);
     } catch (err) {
       console.error(`[bot] failed to send followup to ${userId}:`, err.message);
     }
-  }, dueAt - Date.now());
+  };
+  liveState(userId).followupTimer = longTimeout(fn, dueAt - Date.now());
+}
+
+/** Sends a followup now and chains the next one (the followup invariant). */
+async function deliverFollowup(userId, chatId, text, generation) {
+  await goOnline(userId); // online while typing the followup
+  const sent = await sendHumanLike(chatId, text);
+  for (const burst of sent) {
+    await appendChat(userId, { from: 'me', text: burst, chatId });
+  }
+  scheduleOffline(userId);
+  console.log(`[bot] -> ${userId} (followup): ${text.slice(0, 80)}`);
+  await setState(userId, { pendingFollowup: null });
+  // Followup invariant: immediately plan the NEXT one (scheduled, not sent).
+  // The LLM sees the growing run of unanswered messages and naturally
+  // spaces them out further / changes topic — no clinginess.
+  await chainNextFollowup(userId, chatId, generation);
+  return sent;
 }
 
 async function chainNextFollowup(userId, chatId, generation) {
@@ -230,7 +268,7 @@ async function chainNextFollowup(userId, chatId, generation) {
  * directly, so nothing ever feels like a cron job.
  */
 export async function followupGuardTick() {
-  for (const userId of config.telegram.allowedUserIds) {
+  for (const userId of await knownContactIds()) {
     try {
       const ls = liveState(userId);
       if (ls.replyTimer || ls.followupTimer) continue;
@@ -272,7 +310,7 @@ function runMemoryUpdate(userId) {
  * phone" delay instead of instantly.
  */
 export async function restorePendingTimers() {
-  for (const userId of config.telegram.allowedUserIds) {
+  for (const userId of await knownContactIds()) {
     const state = await getState(userId);
     const ls = liveState(userId);
     const generation = ls.generation;
@@ -281,17 +319,12 @@ export async function restorePendingTimers() {
       const p = state.pendingReply;
       const delay = Math.max(p.dueAt - Date.now(), 5000 + Math.random() * 60000);
       console.log(`[bot] restoring pending reply for ${userId} in ${Math.round(delay / 1000)}s`);
-      ls.replyTimer = longTimeout(async () => {
-        if (liveState(userId).generation !== generation) return;
-        await fireReply(userId, p.chatId, p, generation).catch((err) =>
-          console.error(`[bot] restored reply failed:`, err.message)
-        );
-      }, delay);
+      armReplyTimer(userId, p.chatId, { ...p, dueAt: Date.now() + delay }, generation);
     } else if (state.pendingFollowup) {
       const p = state.pendingFollowup;
       const delay = Math.max(p.dueAt - Date.now(), 5000 + Math.random() * 60000);
       console.log(`[bot] restoring pending followup for ${userId} in ${Math.round(delay / 1000)}s`);
-      await scheduleFollowup(userId, p.chatId, p.text, delay, generation);
+      armFollowupTimer(userId, p.chatId, p.text, Date.now() + delay, generation);
     }
   }
 }
@@ -300,10 +333,13 @@ export async function restorePendingTimers() {
 
 export async function statusSnapshot() {
   const users = {};
-  for (const userId of config.telegram.allowedUserIds) {
+  for (const userId of await knownContactIds()) {
     const state = await getState(userId);
     const chat = await getChat(userId);
+    const chatId = state.chatId ?? chat.at(-1)?.chatId ?? null;
     users[userId] = {
+      name: await getContactName(userId, chatId).catch(() => null),
+      configured: configuredUserIds().includes(userId),
       messagesInLog: chat.length,
       lastMessageAt: chat.at(-1)?.ts ?? null,
       lastMessageFrom: chat.at(-1)?.from ?? null,
@@ -336,6 +372,54 @@ export async function cancelPending(userId, kind) {
     ls.followupTimer = null;
     await setState(userId, { pendingFollowup: null });
   }
+}
+
+/** Edits the queued reply text/reaction and re-arms its timer (same due time). */
+export async function editPendingReply(userId, { text, reaction }) {
+  const state = await getState(userId);
+  if (!state.pendingReply) throw new Error('No pending reply to edit');
+  const p = { ...state.pendingReply };
+  if (text !== undefined) p.text = String(text);
+  if (reaction !== undefined) p.reaction = reaction ? normalizeReaction(reaction) : null;
+  const ls = liveState(userId);
+  ls.replyTimer?.cancel();
+  await setState(userId, { pendingReply: p });
+  armReplyTimer(userId, p.chatId, p, ls.generation);
+  return p;
+}
+
+/** Fires the queued reply immediately (ignores pause — operator-initiated). */
+export async function sendReplyNow(userId) {
+  const state = await getState(userId);
+  if (!state.pendingReply) throw new Error('No pending reply to send');
+  const ls = liveState(userId);
+  ls.replyTimer?.cancel();
+  ls.replyTimer = null;
+  const p = { ...state.pendingReply, dueAt: Date.now() };
+  await fireReply(userId, p.chatId, p, ls.generation);
+  return true;
+}
+
+/** Edits the queued followup text and re-arms its timer (same due time). */
+export async function editPendingFollowup(userId, text) {
+  const state = await getState(userId);
+  if (!state.pendingFollowup) throw new Error('No pending followup to edit');
+  const p = { ...state.pendingFollowup, text: String(text) };
+  const ls = liveState(userId);
+  ls.followupTimer?.cancel();
+  await setState(userId, { pendingFollowup: p });
+  armFollowupTimer(userId, p.chatId, p.text, p.dueAt, ls.generation);
+  return p;
+}
+
+/** Sends the queued followup immediately (ignores pause — operator-initiated). */
+export async function sendFollowupNow(userId) {
+  const state = await getState(userId);
+  if (!state.pendingFollowup) throw new Error('No pending followup to send');
+  const ls = liveState(userId);
+  ls.followupTimer?.cancel();
+  ls.followupTimer = null;
+  return deliverFollowup(userId, state.pendingFollowup.chatId, state.pendingFollowup.text, ls.generation);
 }
 
 /** Sends a manual message as the persona (human-like) and logs it. */
@@ -375,4 +459,19 @@ export async function forceMemoryUpdate(userId) {
   });
   await setMemory(userId, newMemory);
   return newMemory;
+}
+
+/**
+ * Prunes a contact's data to start the conversation from scratch. `parts`
+ * selects which of chat/memory/state to wipe (default: all). Cancels any live
+ * timers and bumps the generation so in-flight work is discarded.
+ */
+export async function pruneContact(userId, parts = { chat: true, memory: true, state: true }) {
+  const ls = cancelTimers(userId); // also bumps generation
+  if (ls.offlineTimer) {
+    clearTimeout(ls.offlineTimer);
+    ls.offlineTimer = null;
+  }
+  await resetContact(userId, parts);
+  return { ...parts };
 }

@@ -9,7 +9,13 @@
  */
 import { downloadMedia } from './telegram.js';
 import { chatCompletion } from './llm.js';
-import { config } from './config.js';
+import { getSettings } from './settings.js';
+
+/** The model used for vision/audio — falls back to the main model. */
+function mediaModel() {
+  const s = getSettings();
+  return s.mediaModel || s.model || undefined;
+}
 
 /**
  * Returns the text representation of an incoming Telegram message,
@@ -61,7 +67,7 @@ async function describePhoto(buffer) {
         ],
       },
     ],
-    { model: config.openrouter.mediaModel, temperature: 0.2 }
+    { model: mediaModel(), temperature: 0.2 }
   );
   return text.trim();
 }
@@ -84,7 +90,7 @@ async function transcribeVoice(buffer, mimeType = 'audio/ogg') {
         ],
       },
     ],
-    { model: config.openrouter.mediaModel, temperature: 0 }
+    { model: mediaModel(), temperature: 0 }
   );
   return text.trim();
 }

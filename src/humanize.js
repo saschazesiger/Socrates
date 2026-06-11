@@ -5,6 +5,7 @@
  * long-running timers that survive setTimeout limits.
  */
 import { sendMessage, sendTyping } from './telegram.js';
+import { behavior } from './settings.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -14,13 +15,13 @@ function rand(min, max) {
 
 /**
  * How long a human would visibly type a message of this length.
- * Roughly 4–7 chars/sec on a phone, clamped so even essays don't show
- * 5 minutes of typing.
+ * Speed range and cap come from settings.behavior so they can be tuned live.
  */
 export function typingDuration(text) {
-  const cps = rand(4, 7);
+  const b = behavior();
+  const cps = rand(b.typingCharsPerSecMin, b.typingCharsPerSecMax);
   const seconds = text.length / cps + rand(0.5, 2);
-  return Math.min(45, Math.max(1.5, seconds)) * 1000;
+  return Math.min(b.typingMaxSeconds, Math.max(1.5, seconds)) * 1000;
 }
 
 /**
@@ -35,15 +36,31 @@ async function typeFor(chatId, ms) {
   }
 }
 
-const TYPO_PROBABILITY = 0.07;
+/**
+ * Types a single message, occasionally pausing partway through for a longer one
+ * (the typing indicator lapses and resumes) — the way a person stops to think
+ * mid-sentence. Frequency comes from settings.behavior.typingPauseChance.
+ */
+async function typeMessage(chatId, text) {
+  const total = typingDuration(text);
+  if (text.length > 35 && Math.random() < (behavior().typingPauseChance ?? 0)) {
+    const split = 0.4 + Math.random() * 0.3; // type 40–70%, pause, finish
+    await typeFor(chatId, total * split);
+    await sleep(rand(700, 1800)); // think — Telegram drops the "typing…" here
+    await typeFor(chatId, total * (1 - split));
+  } else {
+    await typeFor(chatId, total);
+  }
+}
 
 /**
  * Occasionally introduces a realistic fat-finger typo (adjacent letter swap
  * in one word) and returns the "*word" correction to send right after —
  * the classic human pattern. Returns { text, correction|null }.
+ * Probability comes from settings.behavior.typoProbability.
  */
 export function maybeTypo(text) {
-  if (text.length < 15 || Math.random() > TYPO_PROBABILITY) {
+  if (text.length < 15 || Math.random() > behavior().typoProbability) {
     return { text, correction: null };
   }
   const words = text.split(' ');
@@ -74,10 +91,11 @@ export async function sendHumanLike(chatId, text) {
     .map((b) => b.trim())
     .filter(Boolean);
 
+  const b = behavior();
   const sent = [];
   let typoUsed = false; // at most one typo per send — humans aren't that sloppy
   for (let i = 0; i < bursts.length; i++) {
-    if (i > 0) await sleep(rand(800, 2500)); // breather between bursts
+    if (i > 0) await sleep(rand(b.burstGapMinMs, b.burstGapMaxMs)); // breather between bursts
 
     let burst = bursts[i];
     let correction = null;
@@ -86,7 +104,7 @@ export async function sendHumanLike(chatId, text) {
       if (correction) typoUsed = true;
     }
 
-    await typeFor(chatId, typingDuration(burst));
+    await typeMessage(chatId, burst);
     await sendMessage(chatId, burst);
     sent.push(burst);
 
